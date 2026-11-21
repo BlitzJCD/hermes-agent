@@ -255,6 +255,12 @@
         "hermes_cli.session_worktree:restore",
         "hermes_cli.session_worktree:finish"
       ]
+    },
+    {
+      "source": "developer-guide/regex.md § Regular expressions (plugins too): `import hermes_re as re`",
+      "entries": [
+        "hermes_re"
+      ]
     }
   ]
 }

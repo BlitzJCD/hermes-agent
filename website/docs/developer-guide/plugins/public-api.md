@@ -192,3 +192,4 @@ with a name allows that one name only.
 | `hermes_cli.session_worktree` | `create` | user-guide/features/plugins.md § A plugin with its own chat client |
 | `hermes_cli.session_worktree` | `restore` | user-guide/features/plugins.md § A plugin with its own chat client |
 | `hermes_cli.session_worktree` | `finish` | user-guide/features/plugins.md § A plugin with its own chat client |
+| `hermes_re` | whole module | developer-guide/regex.md § Regular expressions (plugins too): `import hermes_re as re` |
