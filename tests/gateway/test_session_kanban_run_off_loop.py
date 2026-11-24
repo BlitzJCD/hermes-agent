@@ -1,6 +1,7 @@
 """Kanban run_task's claim check and owner_admitted marker run off the owner loop (B1-26): the
 Kanban DB is the cross-profile dispatch bus (busy_timeout up to 120 s), so a dispatcher holding
 its writer must not freeze every session on the loop. Real Kanban SQLite, a real held writer."""
+import gateway.run  # noqa: F401
 import asyncio
 from itertools import pairwise
 from contextlib import closing

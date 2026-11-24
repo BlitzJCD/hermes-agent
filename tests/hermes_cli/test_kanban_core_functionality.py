@@ -9,6 +9,7 @@ parity across every registered verb.
 """
 
 from __future__ import annotations
+import gateway.run  # noqa: F401
 
 import os
 import time
