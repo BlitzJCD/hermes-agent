@@ -8,6 +8,7 @@
  */
 
 import { bytesToBase64 } from './base64'
+import { wakeTrace } from './wake-trace'
 
 const TARGET_RATE = 16_000
 const DEFAULT_FRAME = 1280 // 80 ms @ 16 kHz — matches tools/wake_word.py
@@ -47,6 +48,7 @@ export interface ClientWakeCaptureOptions {
 export interface ClientWakeCaptureHandle {
   stop: () => void
   readonly active: boolean
+  diagnostics: () => Record<string, number | string>
 }
 
 function downsampleTo16k(input: Float32Array, inputRate: number): Float32Array {
@@ -108,6 +110,7 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
     throw new Error('getUserMedia unavailable for client wake capture')
   }
 
+  wakeTrace.bump('capture_open_calls')
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: {
       channelCount: 1,
@@ -116,6 +119,9 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
       autoGainControl: true
     },
     video: false
+  }).catch(error => {
+    wakeTrace.bump('capture_open_errors')
+    throw error
   })
 
   // getUserMedia can resolve with a stillborn stream (no audio track, or an
@@ -126,6 +132,7 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
   if (audioTracks.length === 0 || audioTracks.every(track => track.readyState === 'ended')) {
     stream.getTracks().forEach(track => track.stop())
 
+    wakeTrace.bump('capture_open_errors')
     throw new Error('microphone track unavailable for client wake capture')
   }
 
@@ -149,6 +156,10 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
   let stallTimer: ReturnType<typeof setTimeout> | undefined
 
   const handle: ClientWakeCaptureHandle = {
+    diagnostics() {
+      wakeTrace.captureHealth(audioTracks, context.state)
+      return wakeTrace.snapshot()
+    },
     get active() {
       return !stopped
     },
@@ -158,6 +169,8 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
       }
 
       stopped = true
+      wakeTrace.bump('capture_stops')
+      wakeTrace.bump('frames_stop_dropped', queue.length)
       queue.length = 0
 
       if (stallTimer !== undefined) {
@@ -175,6 +188,7 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
 
       void context.close().catch(() => undefined)
       stream.getTracks().forEach(t => t.stop())
+      wakeTrace.captureHealth(audioTracks, context.state)
     }
   }
 
@@ -186,6 +200,7 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
     }
 
     failed = true
+    wakeTrace.bump('capture_failures')
     handle.stop()
     options.onError?.(error)
   }
@@ -270,6 +285,8 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
           batch.forEach((frame, i) => merged.set(frame, i * frameLength))
           const pcm = floatToInt16LE(merged)
 
+          wakeTrace.bump('feed_calls_sent')
+          wakeTrace.bump('feed_frames_sent', batch.length)
           const result = (await options.request('wake.feed', {
             pcm: bytesToBase64(pcm),
             sample_rate: TARGET_RATE
@@ -277,8 +294,18 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
 
           // Absent on older backends that predate the {fed} envelope — only an
           // explicit fed:false counts as a refusal. Thrown RPC errors land below.
+          if (result?.fed === true) {
+            wakeTrace.bump('feed_ack_ok')
+            wakeTrace.bump('feed_frames_acknowledged', batch.length)
+          } else if (result?.fed === false) {
+            wakeTrace.bump('feed_ack_refused')
+            wakeTrace.bump('feed_frames_refused', batch.length)
+          } else {
+            wakeTrace.bump('feed_ack_unknown')
+          }
           noteFeedResult(!result || result.fed !== false, result?.reason ?? null)
         } catch {
+          wakeTrace.bump('feed_rpc_errors')
           // Keep draining later frames; one failed RPC should not freeze the ear.
           noteFeedResult(false, null)
         }
@@ -298,9 +325,11 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
     }
 
     queue.push(frame)
+    wakeTrace.bump('frames_queued')
 
     while (queue.length > MAX_QUEUED_FRAMES) {
       queue.shift()
+      wakeTrace.bump('queue_dropped')
     }
 
     void drainQueue()
@@ -312,6 +341,8 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
     }
 
     armStallTimer()
+    wakeTrace.bump('audio_callbacks')
+    wakeTrace.captureHealth(audioTracks, context.state)
 
     const input = event.inputBuffer.getChannelData(0)
     const at16k = downsampleTo16k(input, context.sampleRate)
@@ -324,6 +355,7 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
     while (offset + frameLength <= merged.length) {
       const frame = merged.subarray(offset, offset + frameLength)
       offset += frameLength
+      wakeTrace.bump('pcm_frames_generated')
 
       // A dead capture chain delivers endless digital zeros. Live mics never
       // do — their noise floor sits far above SILENCE_PEAK — so a long run of
@@ -339,6 +371,7 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
       }
 
       if (peak < SILENCE_PEAK) {
+        wakeTrace.bump('silent_frames_skipped')
         silentFrames += 1
 
         if (silentFrames >= silenceFramesThreshold) {
@@ -370,6 +403,8 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
   }
 
   armStallTimer()
+  wakeTrace.bump('graph_started')
+  wakeTrace.captureHealth(audioTracks, context.state)
 
   return handle
 }

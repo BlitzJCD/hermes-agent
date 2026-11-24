@@ -1,7 +1,9 @@
 # Excel (.xlsx, .csv)
 
-Run the helpers with `"$PY"` from the Prerequisites block in `SKILL.md`, from the
-skill directory.
+Run the helpers from the skill directory. In a Docker terminal configured
+with the [XLSX sandbox image](../../../../docker/sandbox-xlsx.md), set
+`PY=/opt/hermes-xlsx/bin/python` inside the terminal. For other environments,
+use the Prerequisites block in `SKILL.md`.
 
 Work with Excel .xlsx workbooks using Python and openpyxl: build styled
 multi-sheet workbooks with formulas and charts, inspect or dump existing

@@ -515,6 +515,7 @@ class WakeStatusResult(Result):
     """``enabled`` is config truth; ``listening`` is this caller's armed detector; ``audio_silent``
     means armed but deaf (see ``hint``)."""
 
+    diagnostics: dict[str, int | str] | None = None
     listening: bool
     owned_by_caller: bool
     owner_surface: str | None = None

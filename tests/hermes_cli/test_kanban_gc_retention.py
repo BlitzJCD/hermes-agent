@@ -49,6 +49,23 @@ def test_gc_events_rejects_negative_window(board):
             kb.gc_events(conn, older_than_seconds=-86400)
         assert _event_rows(conn, tid) > 0
 
+
+def test_gc_preserves_spent_owner_admission(board):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="admitted", assignee="default")
+        run_id = kb.claim_task(conn, task_id).current_run_id
+        with kb.write_txn(conn):
+            kb._append_event(conn, task_id, "owner_admitted", {"session_id": "owner-session"}, run_id=run_id)
+        assert kb.complete_task(conn, task_id, expected_run_id=run_id, result="finished")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_events SET created_at=0 WHERE task_id=?", (task_id,))
+        assert kb.gc_events(conn, older_than_seconds=1) > 0
+    with kbc.connect_closing() as conn:
+        rows = conn.execute(
+            "SELECT kind, run_id FROM task_events WHERE task_id=?", (task_id,),
+        )
+        assert [tuple(row) for row in rows] == [("owner_admitted", run_id)]
+
 def test_gc_worker_logs_rejects_negative_window(board):
     log = _old_log_file()
     with pytest.raises(ValueError, match="older_than_seconds"):

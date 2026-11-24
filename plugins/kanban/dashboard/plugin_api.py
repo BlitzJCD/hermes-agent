@@ -582,7 +582,11 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
     ``review_reopened`` event) instead of a raw write; ``triage`` needs no current-state query."""
     current = kanban_db.get_task(conn, task_id) if s != "triage" else None
     if s == "ready" and current and current.status in ("blocked", "scheduled"):
-        return kanban_db.unblock_task(conn, task_id)
+        return kanban_db.unblock_task(conn, task_id, operator=True)
+    if s == "ready" and current and current.status == "running":
+        if not kanban_db._parents_satisfied(conn, task_id):
+            return False
+        return kanban_db.reclaim_task(conn, task_id, reason="dashboard status")
     if current is not None and current.status == "review":
         return kanban_db.reopen_review_task(conn, task_id)
     return _set_status_direct(conn, task_id, s)
@@ -752,9 +756,8 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
         if prev is None:
             return False
         if prev["status"] == "running" and new_status == "ready":
-            resume_status = kanban_db._retry_status_for_run(conn, task_id, prev["current_run_id"])
-            if resume_status == "review":
-                effective_status = "review" if kanban_db._parents_satisfied(conn, task_id) else "todo"
+            # A claim won the race after the drag handler read the old status.
+            return False
         # Never promote to 'ready' unless all parents are done/archived — otherwise the
         # dispatcher spawns a child whose upstream work hasn't completed.
         if effective_status == "ready" and not kanban_db._parents_satisfied(conn, task_id):
@@ -779,6 +782,8 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'status', ?, ?)",
             (task_id, run_id, json.dumps({"status": effective_status, "requested_status": new_status}), int(time.time())))
+        if effective_status in {"ready", "todo"} and not was_running and prev["status"] != effective_status:
+            kanban_db._authorize_dispatch(conn, task_id, "dashboard_status")
         if reopening_satisfied_parent:
             # Domain-layer invalidation composes via a savepoint inside our txn and hands
             # back worker terminations to perform post-commit.

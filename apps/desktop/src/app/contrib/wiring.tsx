@@ -1,3 +1,6 @@
+import { wakeTrace } from '@/lib/wake-trace'
+import { wakeTraceBlocked } from '@/lib/wake-trace-run'
+
 /**
  * Real-featureset wiring for the contrib (layout tree) root — the minimal
  * subset of DesktopController's hook chain that makes the REAL surfaces work:
@@ -831,6 +834,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       emitGatewayEvent(event)
 
       if (event.type === 'wake.detected') {
+        wakeTrace.bump('event_received')
+        if (wakeTraceBlocked()) {
+          wakeTrace.bump('late_events_dropped')
+          return
+        }
         const payload = event.payload as { profile?: null | string; start_new_session?: boolean } | undefined
 
         // Free the Mac mic so voice conversation can open getUserMedia.
@@ -862,6 +870,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
           startFreshSessionDraft()
         }
 
+        wakeTrace.bump('handoff_requested')
         requestVoiceConversationStart()
 
         return

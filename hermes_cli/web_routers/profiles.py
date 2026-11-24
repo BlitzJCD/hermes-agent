@@ -26,10 +26,11 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from hermes_cli.session_listing import subagent_listing_scope
 from hermes_cli.web_deps import late
+from hermes_cli.web_session_ownership import scoped_session_reader, session_request_scope
 from hermes_cli.config import get_process_hermes_home
 from hermes_cli.profiles import ProfileIdentitySettlementPending
 from hermes_cli.web_server_config import (
@@ -68,7 +69,7 @@ def _warn_profile_read_error(profile: str, exc: Exception) -> None:
     _log.warning("profile session read failed for %r (reported only in the response "
                  "errors array): %s", profile, exc)
 
-sessions_router = APIRouter()
+sessions_router = APIRouter(dependencies=[Depends(session_request_scope)])
 router = APIRouter()
 
 # Late-bound web_server helpers (resolved at call time; cycle-safe, monkeypatch-transparent).
@@ -231,6 +232,9 @@ def _profile_targets(log_label: str) -> list[tuple[str, Path]]:
         targets = []
     if not targets:
         targets.append(("default", profiles_mod.get_profile_dir("default")))
+    scope = scoped_session_reader()
+    if scope and scope.home:
+        return [(name, home) for name, home in targets if Path(home).resolve() == Path(scope.home).resolve()]
     return targets
 
 
@@ -416,7 +420,7 @@ def _sidebar_singleflight_cache(func):
 
         bound = signature.bind(*args, **kwargs)
         bound.apply_defaults()
-        key = tuple(bound.arguments.items())
+        key = (scoped_session_reader(), *bound.arguments.items())
         cached = _lookup(key)
         if cached is not miss:
             return cached
@@ -582,7 +586,7 @@ def get_profiles_sessions_sidebar(
         if not db_path.exists():
             continue
         recents_subagents = subagent_listing_scope(home, exclude_sources=recents_exclude_list or None)
-        profile_cache_key = (str(db_path), _sidebar_db_fingerprint(db_path), cap["recents"],
+        profile_cache_key = (str(db_path), _sidebar_db_fingerprint(db_path), scoped_session_reader(), cap["recents"],
                              tuple(recents_exclude_list), cap["cron"], cap["messaging"],
                              tuple(messaging_exclude_list), recents_subagents[0])
         slices = _sidebar_profile_cache_get(profile_cache_key)

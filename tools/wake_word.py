@@ -31,6 +31,8 @@ from tools.wake_word_engines import (
     _SherpaKwsEngine,
 )
 
+from tools.wake_diagnostics import WakeDiagnostics
+
 logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000  # 16 kHz mono int16 — Whisper-native and what every engine expects.
@@ -499,6 +501,7 @@ class WakeWordDetector:
     def __init__(self, engine: _Engine, on_wake: Callable[[], None], cooldown: float = _FIRE_COOLDOWN_SECONDS,
                  on_failure: Optional[Callable[[WakeWordDetector], None]] = None,
                  input_device: int | str | None = None, external_audio: bool = False):
+        self.diagnostics = WakeDiagnostics()
         self.engine, self.on_wake, self.cooldown, self.on_failure = engine, on_wake, cooldown, on_failure
         self.input_device, self.external_audio = input_device, bool(external_audio)
         self.input_device_details: dict[str, Any] = (
@@ -524,16 +527,23 @@ class WakeWordDetector:
     def feed(self, pcm_int16) -> None:
         """Enqueue one int16 mono frame (or raw bytes) for client capture. Short frames are
         zero-padded to ``engine.frame_length``, long ones split; on overflow the oldest is dropped."""
+        self.diagnostics.bump("feed_calls")
         if not self.external_audio:
             return
         try:
             import numpy as np
         except Exception:
+            self.diagnostics.bump("feed_errors")
             return
-        if isinstance(pcm_int16, (bytes, bytearray, memoryview)):
-            arr = np.frombuffer(pcm_int16, dtype=np.int16)
-        else:
-            arr = np.asarray(pcm_int16, dtype=np.int16).reshape(-1)
+        try:
+            if isinstance(pcm_int16, (bytes, bytearray, memoryview)):
+                arr = np.frombuffer(pcm_int16, dtype=np.int16)
+            else:
+                arr = np.asarray(pcm_int16, dtype=np.int16).reshape(-1)
+        except Exception:
+            self.diagnostics.bump("feed_errors")
+            raise
+        self.diagnostics.bump("feed_samples", int(arr.size))
         fl = int(self.engine.frame_length)
         if fl <= 0:
             return
@@ -543,18 +553,27 @@ class WakeWordDetector:
                 chunk = np.pad(chunk, (0, fl - chunk.shape[0]))
             try:
                 self._audio_q.put_nowait(chunk)
-            except Exception:
-                # Drop oldest on overflow so we stay real-time
-                with suppress(Exception):
+                self.diagnostics.bump("queue_enqueued")
+            except queue.Full:
+                # Drop oldest on overflow so we stay real-time.
+                try:
                     self._audio_q.get_nowait()
-                with suppress(Exception):
+                    self.diagnostics.bump("queue_dropped")
+                except queue.Empty:
+                    pass
+                try:
                     self._audio_q.put_nowait(chunk)
+                    self.diagnostics.bump("queue_enqueued")
+                except queue.Full:
+                    self.diagnostics.bump("queue_dropped")
 
     def start(self) -> None:
         """Open the mic (or client feeder) and begin listening. Idempotent."""
+        self.diagnostics.bump("start_calls")
         with self._lock:
             if self.running:
                 return
+            self.diagnostics.state("starting")
             self._stop.clear()
             ready = threading.Event()
             startup_errors: list[BaseException] = []
@@ -563,6 +582,8 @@ class WakeWordDetector:
             self._thread.start()
         if not ready.wait(_START_TIMEOUT_SECONDS):
             self._halt_thread()
+            self.diagnostics.bump("failures")
+            self.diagnostics.state("failed")
             raise TimeoutError("Timed out while opening the wake-word microphone.")
         if startup_errors:
             self._halt_thread()
@@ -570,14 +591,27 @@ class WakeWordDetector:
 
     # pause/resume keep the engine; stop tears it down.
     def pause(self) -> None:
+        self.diagnostics.bump("pause_calls")
         self._halt_thread()
+        self.diagnostics.state("paused")
 
     def resume(self) -> None:
+        self.diagnostics.bump("resume_calls")
         self.start()
 
     def stop(self) -> None:
+        self.diagnostics.bump("stop_calls")
         self._halt_thread()
-        self.engine.close()
+        while True:
+            try:
+                self._audio_q.get_nowait()
+                self.diagnostics.bump("queue_stop_dropped")
+            except queue.Empty:
+                break
+        try:
+            self.engine.close()
+        finally:
+            self.diagnostics.state("stopped")
 
     def _halt_thread(self) -> None:
         with self._lock:
@@ -605,6 +639,7 @@ class WakeWordDetector:
         try:
             self.on_wake()
         except Exception as e:
+            self.diagnostics.bump("callback_errors")
             logger.warning("wake word callback failed: %s", e)
         finally:
             self._callback_inflight.clear()
@@ -615,6 +650,7 @@ class WakeWordDetector:
             with suppress(Exception):  # drain stale frames from a previous arm
                 while True:
                     self._audio_q.get_nowait()
+                    self.diagnostics.bump("queue_stale_dropped")
             logger.info("wake word: client-capture mode (frame=%d, rate=%d) — waiting for wake.feed",
                         frame_length, SAMPLE_RATE)
             return _Capture(queue=self._audio_q, frame_length=frame_length)
@@ -669,12 +705,14 @@ class WakeWordDetector:
         """Honor the cooldown, then run ``on_wake`` on its own thread (once)."""
         now = time.monotonic()
         if now - self._last_fire < self.cooldown:
+            self.diagnostics.bump("cooldown_suppressed")
             logger.debug("wake word: detection within cooldown — ignored")
             return
         self._last_fire = now
         logger.info("wake word: phrase detected — firing callback")
         if not self._callback_inflight.is_set():
             self._callback_inflight.set()
+            self.diagnostics.bump("callback_dispatched")
             threading.Thread(target=self._dispatch_wake, daemon=True, name="wake-word-callback").start()
 
     def _recover_capture(self, frame_length: int, retries) -> Optional[_Capture]:
@@ -703,6 +741,8 @@ class WakeWordDetector:
             cap = self._open_capture(frame_length)
             self._cap = cap
         except Exception as e:
+            self.diagnostics.bump("failures")
+            self.diagnostics.state("failed")
             startup_errors.append(e)
             ready.set()
             return
@@ -712,6 +752,7 @@ class WakeWordDetector:
             self.engine.reset()
         logger.info("wake word: listening (frame=%d, rate=%d, external=%s)",
                     frame_length, SAMPLE_RATE, self.external_audio)
+        self.diagnostics.state("listening")
         ready.set()
         failed = False
         # Bound the whole arm, not just consecutive open failures: a device can
@@ -738,21 +779,36 @@ class WakeWordDetector:
                 if data is None:  # no client frames yet — counts as silence for status
                     self._note_silence(None, silent_alert_frames)
                     continue
+                if self.external_audio:
+                    self.diagnostics.bump("queue_consumed")
                 frame = data[:, 0] if getattr(data, "ndim", 1) == 2 else data
                 if cap.rate != SAMPLE_RATE:
                     frame = _resample_audio_frame(cap.np, frame, frame_length)
                 self._note_silence(frame, silent_alert_frames)
+                self.diagnostics.bump("engine_calls")
                 try:
-                    if self.engine.process(frame):
-                        self._fire()
+                    hit = bool(self.engine.process(frame))
                 except Exception as e:
+                    self.diagnostics.bump("engine_errors")
                     logger.debug("wake word: engine error: %s", e)
+                else:
+                    # False describes this chunk only, not an utterance rejection.
+                    self.diagnostics.bump("engine_hits" if hit else "engine_no_hit_chunks")
+                    if hit:
+                        try:
+                            self._fire()
+                        except Exception as e:
+                            self.diagnostics.bump("fire_errors")
+                            logger.debug("wake word: engine error: %s", e)
         finally:
             if cap is not None:
                 cap.close()
             logger.info("wake word: stream closed")
-            if failed and self.on_failure is not None:
-                self.on_failure(self)
+            if failed:
+                self.diagnostics.bump("failures")
+                self.diagnostics.state("failed")
+                if self.on_failure is not None:
+                    self.on_failure(self)
 
 
 # ── Process-wide singleton (mirrors hermes_cli.voice's continuous API) ──
@@ -812,10 +868,15 @@ def _teardown_locked(close: Callable[[], None]) -> None:
     """Forget the singleton and run ``close``, always releasing the machine lease (caller holds the lock)."""
     global _detector, _detector_owner, _detector_file_lock
     lock_handle = _detector_file_lock
+    detector, owner = _detector, _detector_owner
     _detector = _detector_owner = _detector_file_lock = None
     try:
         close()
     finally:
+        if detector is not None and owner is not None:
+            # Retention lives only on the original transport, not a global registry.
+            with suppress(AttributeError, TypeError):
+                setattr(owner, "_wake_diagnostics", detector.diagnostics.snapshot())
         _release_machine_lock(lock_handle)
 
 
@@ -875,6 +936,30 @@ def _owned_call(owner: object, action: Optional[Callable[[WakeWordDetector], Non
 
 def owns_listener(owner: object) -> bool:
     return _owned_call(owner)
+
+
+def get_diagnostic_trace(*, owner: object):
+    """Internal event instrumentation: pin the actual owner's detector trace."""
+    with _detector_lock:
+        det = _owned_detector(owner)
+        return det.diagnostics if det is not None else None
+
+
+def diagnostic_snapshot(*, owner: object) -> dict | None:
+    """Only this caller's live trace or its own retained scalar snapshot."""
+    trace = get_diagnostic_trace(owner=owner)
+    if trace is not None:
+        return trace.snapshot()
+    saved = getattr(owner, "_wake_diagnostics", None)
+    if not isinstance(saved, dict) or saved.get("state") not in WakeDiagnostics.STATES:
+        return None
+    result = {"state": saved["state"]}
+    for field in WakeDiagnostics.FIELDS:
+        value = saved.get(field)
+        if type(value) is not int or not 0 <= value <= WakeDiagnostics.LIMIT:
+            return None
+        result[field] = value
+    return result
 
 
 def pause_listening(*, owner: object) -> bool:

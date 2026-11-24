@@ -1,126 +1,182 @@
-"""Global emergency stop (ESTOP) — a resumable pause for NEW work only.
-
-``hermes pause`` writes a sentinel at ``$HERMES_HOME/ESTOP``; ``hermes resume``
-removes it. While it exists the cron scheduler, kanban dispatcher and new gateway
-turns skip work; in-flight work is never killed. The check is one or two uncached
-``os.stat`` calls (process home + fleet root when they differ). The body is optional
-JSON ``{"reason", "engaged_at"}``; a corrupt/empty file still counts as engaged
-(fail safe, e.g. ``touch ~/.hermes/ESTOP``). Ported from gastownhall/gastown estop.go (MIT).
-"""
+"""Filesystem emergency stop for admission and cooperative cron cancellation."""
 
 from __future__ import annotations
 
 import json
 import logging
+import stat
 import threading
 from contextlib import suppress
-from datetime import datetime, timezone, UTC
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional
 
-# Same profile-aware / fleet-root resolvers the file-safety guards use (fail-open to ~/.hermes).
-from agent.file_safety import _hermes_home_path as _hermes_home, _hermes_root_path as _canonical_root
+from hermes_constants import get_default_hermes_root, get_hermes_home
 
 SENTINEL_NAME = "ESTOP"
-
-# Per-component "logged already for this engagement" flags: log once per engagement, not per tick.
+CANCEL_REASON = "Hermes emergency stop"
 _log_lock = threading.Lock()
 _logged_components: set[str] = set()
 
 
 def sentinel_path() -> Path:
-    """Path of the ESTOP sentinel this process would write on `hermes pause`."""
-    return _hermes_home() / SENTINEL_NAME
+    return get_hermes_home() / SENTINEL_NAME
 
 
-def _candidate_sentinel_paths() -> list:
-    """Profile home first, then the fleet root if it is a different directory: a profile
-    gateway (HERMES_HOME=~/.hermes/profiles/<n>) must still honor an operator's ~/.hermes/ESTOP."""
-    primary = sentinel_path()
+def _canonical_root(home):
+    return get_default_hermes_root(home=home)
+
+
+def _targets():
+    local = sentinel_path()
     try:
-        root = _canonical_root() / SENTINEL_NAME
-    except Exception:
-        return [primary]
+        fleet = _canonical_root(local.parent).resolve() / SENTINEL_NAME
+        return tuple(dict.fromkeys((local.parent.resolve() / SENTINEL_NAME, fleet))), ()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return (local,), (f"Cannot resolve fleet ESTOP root ({exc})",)
+
+
+def _probe(path, *, follow=True):
     try:
-        distinct = root.resolve() != primary.resolve()
-    except Exception:
-        # Non-Path test doubles fail .resolve(); plain equality still dedupes.
-        distinct = root != primary
-    return [primary, root] if distinct else [primary]
+        stamp = path.lstat()
+    except FileNotFoundError:
+        return None
+    if follow and stat.S_ISLNK(stamp.st_mode):
+        path.stat()  # A dangling link is an uncertain stop, not a missing sentinel.
+    return stamp
+
+
+def _observe(paths, errors):
+    errors = list(errors)
+    observed = []
+    for path in paths:
+        try:
+            if _probe(path) is not None:
+                observed.append(path)
+        except OSError as exc:
+            errors.append(f"Cannot read {path} ({exc})")
+    return observed, errors
 
 
 def is_engaged() -> bool:
-    """True if ANY candidate sentinel exists; fail SAFE (True) on stat errors."""
-    saw_stat_error = False
-    for path in _candidate_sentinel_paths():
-        try:
-            if path.exists():
-                return True
-        except OSError:
-            saw_stat_error = True
-    return saw_stat_error
+    """Any sentinel or uncertainty closes admission."""
+    observed, errors = _observe(*_targets())
+    return bool(observed or errors)
 
 
-def engage(reason: Optional[str] = None) -> Path:
-    """Create the ESTOP sentinel. Idempotent; re-engaging updates the file."""
+def engage_checked(reason: str | None = None) -> tuple[Path, list[str]]:
+    """Write the local sentinel even when fleet scope cannot be resolved."""
+    from utils import atomic_json_write
+
     path = sentinel_path()
-    payload = {"engaged_at": datetime.now(UTC).isoformat(), "reason": reason or None}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    except OSError:
-        with suppress(OSError):  # Best effort: an empty/partial sentinel still pauses (fail safe).
-            path.touch(exist_ok=True)
-    return path
+        atomic_json_write(path, {"engaged_at": datetime.now(UTC).isoformat(), "reason": reason or None},
+                          mode=0o600, fsync_dir=True)
+    except OSError as exc:
+        try:
+            # An empty sentinel still works when the metadata write cannot.
+            path.touch(exist_ok=False)
+        except OSError:
+            return path, [f"Cannot write {path} ({exc})"]
+    paths, resolution_errors = _targets()
+    observed, errors = _observe(paths, resolution_errors)
+    if paths[0] not in observed:
+        errors.append(f"Local pause could not be confirmed at {path}")
+    return path, errors
+
+
+def _last_pause(path):
+    return path.with_name(path.name + ".last")
+
+
+def disengage_checked() -> tuple[bool, list[str]]:
+    """Clear admission while retaining the engagement for workers between polls."""
+    paths, resolution_errors = _targets()
+    errors = list(resolution_errors)
+    lifted = False
+    for path in paths:
+        try:
+            if stat.S_ISDIR(path.lstat().st_mode):
+                raise IsADirectoryError(str(path))
+            path.replace(_last_pause(path))
+            lifted = True
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            errors.append(f"Cannot clear {path} ({exc})")
+    observed, read_errors = _observe(paths, ())
+    errors.extend(read_errors)
+    errors.extend(f"Pause still present at {path}" for path in observed)
+    return lifted, errors
+
+
+def engage(reason: str | None = None) -> Path:
+    return engage_checked(reason)[0]
 
 
 def disengage() -> bool:
-    """Remove every visible sentinel (process-local and fleet-root)."""
-    lifted = False
-    for path in _candidate_sentinel_paths():
-        try:
-            path.unlink()
-            lifted = True
-        except (OSError, AttributeError):
-            continue
-    return lifted
+    lifted, errors = disengage_checked()
+    return lifted and not errors
 
 
-def get_state() -> Optional[dict]:
-    """Return ``{"reason", "engaged_at"}`` or None when not engaged; an unreadable/corrupt
-    body still reports engaged with both fields None."""
-    if not is_engaged():
+def get_state() -> dict | None:
+    """Read status once; distinguish verified admission hold from uncertainty."""
+    observed, errors = _observe(*_targets())
+    if not observed and not errors:
         return None
-    state = {"reason": None, "engaged_at": None}
-    found = False
-    for path in _candidate_sentinel_paths():
-        try:
-            if not path.exists():
-                continue
-        except OSError:
-            return state
-        except AttributeError:
-            continue
-        found = True
-        with suppress(OSError, ValueError, AttributeError):
+    state = {"reason": None, "engaged_at": None, "errors": errors}
+    for path in observed:
+        with suppress(OSError, ValueError):
             raw = json.loads(path.read_text(encoding="utf-8-sig"))
             if isinstance(raw, dict):
-                state = {"reason": raw.get("reason") or None, "engaged_at": raw.get("engaged_at") or None}
+                state.update(reason=raw.get("reason") or None, engaged_at=raw.get("engaged_at") or None)
                 break
-    return state if found else None
+    return state
 
 
-def paused_reply() -> Optional[str]:
-    """Short user-facing notice for new gateway turns, or None if not paused."""
+class CronStop:
+    """Latch a pause for the lifetime of an admitted cron worker."""
+
+    reason = CANCEL_REASON
+
+    def __init__(self):
+        self.paths, errors = _targets()
+        self.generation = ()
+        self.cancelled = bool(errors)
+        try:
+            self.generation = self._generation()
+        except OSError:
+            self.cancelled = True
+        self.is_set()
+
+    def _generation(self):
+        return tuple((stamp.st_dev, stamp.st_ino, stamp.st_mtime_ns) if stamp else None
+                     for stamp in (_probe(_last_pause(path), follow=False) for path in self.paths))
+
+    def is_set(self):
+        if not self.cancelled:
+            try:
+                self.cancelled = (any(_probe(path) is not None for path in self.paths)
+                                  or self._generation() != self.generation)
+            except OSError:
+                self.cancelled = True
+        return self.cancelled
+
+    def set(self):
+        self.cancelled = True
+
+
+def paused_reply() -> str | None:
     state = get_state()
     if state is None:
         return None
-    tag = f" ({state['reason']})" if state.get("reason") else ""
+    if state["errors"]:
+        return "⏸️ Hermes cannot verify the emergency stop state. New work is on hold."
+    tag = f" ({state['reason']})" if state["reason"] else ""
     return f"⏸️ Hermes is paused{tag}. New work is on hold; run `hermes resume` to pick things back up."
 
 
 def check_paused(component: str, logger: logging.Logger) -> bool:
-    """Return True when engaged, logging once per engagement per component (re-armed after a resume)."""
     if not is_engaged():
         with _log_lock:
             _logged_components.discard(component)
@@ -129,10 +185,5 @@ def check_paused(component: str, logger: logging.Logger) -> bool:
         first = component not in _logged_components
         _logged_components.add(component)
     if first:
-        reason = (get_state() or {}).get("reason")
-        suffix = f" (reason: {reason})" if reason else ""
-        logger.info(
-            "%s dispatch paused by global emergency stop%s — remove with `hermes resume` (%s)",
-            component, suffix, sentinel_path(),
-        )
+        logger.info("%s admission held by emergency stop (%s)", component, sentinel_path())
     return True

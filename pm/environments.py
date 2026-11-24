@@ -159,6 +159,8 @@ def _payload_manifest(root: Path) -> tuple[dict, Path] | None:
     """
     for path in (root.parent / "manifest.json", root / "manifest.json"):
         try:
+            if not path.exists():
+                continue
             manifest = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             continue

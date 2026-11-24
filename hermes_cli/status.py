@@ -101,6 +101,8 @@ def _estop_status_line():
     state = get_state()
     if state is None:
         return None
+    if state["errors"]:
+        return "⏸️  Emergency stop state uncertain. New work is on hold."
     reason = state.get("reason")
     return f"⏸️  PAUSED (global emergency stop{f' — reason: {reason}' if reason else ''}; `hermes resume` to lift)"
 

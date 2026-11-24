@@ -3128,6 +3128,7 @@ export interface WakeStatusParams {
 }
 /** ``enabled`` is config truth; ``listening`` is this caller's armed detector; ``audio_silent`` means armed but deaf (see ``hint``). */
 export interface WakeStatusResult {
+  diagnostics?: Record<string, number | string> | null
   listening: boolean
   owned_by_caller: boolean
   owner_surface?: string | null

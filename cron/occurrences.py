@@ -1,6 +1,6 @@
 """Exact scheduled identities, independent of mutable jobs.json dispatch stamps, plus the
 profile-local stale-schedule catch-up counter marker."""
-from datetime import datetime, timedelta, timezone, UTC
+from datetime import datetime, timedelta, UTC
 import logging
 
 logger = logging.getLogger(__name__)
@@ -19,40 +19,78 @@ def scheduled_instant(value):
         return None
 
 
-def completed_occurrence(job, instant):
-    """Unknown/failed/pruned attempts cannot prove completion: keep them eligible."""
+def occurrence_status(job, instant, *, execution_id=None):
+    """Return clear, completed, spent, or held for an exact scheduled occurrence.
+
+    An unavailable ledger cannot establish that a fire is new. A failed
+    preparation that never started is eligible again within normal grace.
+    """
     from cron.constants import FIRE_CLAIM_SKEW_SECONDS
     from cron.executions import _transaction
 
     instant = scheduled_instant(instant)
     if instant is None:
-        return False
-    # A skewed early fire (see claim_job_for_fire) legitimately completes just before its slot.
-    earliest_real = datetime.fromisoformat(instant) - timedelta(seconds=FIRE_CLAIM_SKEW_SECONDS)
+        return "clear"
+    earliest = datetime.fromisoformat(instant) - timedelta(seconds=FIRE_CLAIM_SKEW_SECONDS)
     try:
         with _transaction() as conn:
             rows = conn.execute(
-                "SELECT id, finished_at, claimed_at FROM executions "
-                "WHERE job_id=? AND scheduled_instant=? "
-                "AND status='completed'", (str(job['id']), instant)
+                "SELECT id, status, started_at, finished_at, claimed_at FROM executions "
+                "WHERE job_id=? AND scheduled_instant=? AND id IS NOT ?",
+                (str(job["id"]), instant, execution_id),
             ).fetchall()
-        for row in rows:
+    except Exception:
+        logger.warning("Cannot verify occurrence for job %s; deferring fire", job["id"], exc_info=True)
+        return "held"
+    disposition = "clear"
+    for row in rows:
+        status = row["status"]
+        if status == "completed":
             completed_at = scheduled_instant(row["finished_at"] or row["claimed_at"])
-            # Legacy or malformed timestamps remain proof; only positively identified poison
-            # rows — completions recorded before their claimed occurrence — are ignored.
-            if completed_at is None or datetime.fromisoformat(completed_at) >= earliest_real:
-                # Both dedup gates (due scan and fire claim) consume the slot on True without a
-                # run or a ledger row, so this line is the only trace the skip leaves (#111414).
+            if completed_at is None or datetime.fromisoformat(completed_at) >= earliest:
                 logger.warning(
                     "Job '%s' (%s): scheduled occurrence %s was already completed by execution "
                     "%s (finished %s); skipping the due slot without a new run",
-                    job.get("name", job.get("id")), job.get("id"), instant, row["id"],
-                    row["finished_at"] or row["claimed_at"])
-                return True
-        return False
-    except Exception:
-        logger.warning("Cannot check completed occurrence for job %s", job['id'], exc_info=True)
-        return False
+                    job.get("name", job["id"]), job["id"], instant, row["id"],
+                    row["finished_at"] or row["claimed_at"],
+                )
+                return "completed"
+        elif status in {"unknown", "cancelled"} or (status == "failed" and row["started_at"]):
+            disposition = "spent"
+        elif status in {"claimed", "running"} and disposition == "clear":
+            disposition = "held"
+    return disposition
+
+
+def completed_occurrence(job, instant):
+    """Whether the ledger contains proof of successful completion."""
+    return occurrence_status(job, instant) == "completed"
+
+
+def resolve_fire_occurrence(job, now, *, manual, expected):
+    """Match the dispatch snapshot to its stored slot before issuing a lease."""
+    from cron.constants import FIRE_CLAIM_SKEW_SECONDS
+    from cron.missed_runs import oneshot_grace_expired
+
+    if manual:
+        return expected is None, None
+    kind = job.get("schedule", {}).get("kind")
+    pending = job.get("pending_slot")
+    stored = job.get("next_run_at")
+    if kind in {"cron", "interval"} and isinstance(pending, dict):
+        stored = pending.get("scheduled_at")
+    instant = scheduled_instant(stored)
+    if expected is not None and expected != instant:
+        return False, None
+    if instant is None:
+        return True, None  # legacy wall-clock records have no exact ledger identity
+    due = datetime.fromisoformat(instant)
+    if due - now >= timedelta(seconds=FIRE_CLAIM_SKEW_SECONDS):
+        # Off-tick fire before the next slot. It does not consume that slot.
+        return expected is None, None
+    if kind == "once" and oneshot_grace_expired(job, due, now):
+        return False, None
+    return True, instant
 
 
 # --- Pending slot: the occurrence a tick took off the schedule but has not yet claimed ---

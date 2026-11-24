@@ -49218,6 +49218,28 @@
         "additionalProperties": false,
         "description": "``enabled`` is config truth; ``listening`` is this caller's armed detector; ``audio_silent``\nmeans armed but deaf (see ``hint``).",
         "properties": {
+          "diagnostics": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "string"
+                    }
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Diagnostics"
+          },
           "listening": {
             "title": "Listening",
             "type": "boolean"

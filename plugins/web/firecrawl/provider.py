@@ -134,6 +134,33 @@ class _KeylessFirecrawlClient:
         return self._post("/v2/scrape", payload)
 
 
+
+class _SelfHostedFirecrawlClient(_KeylessFirecrawlClient):
+    """Send a scrape only to the configured operator-owned API endpoint."""
+
+    def __init__(self, api_url: str, api_key: str = ""):
+        super().__init__(api_url)
+        self.api_key = api_key
+
+    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        from agent.ssl_verify import resolve_httpx_verify
+
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        # The operator configures the API destination itself, which may be on a
+        # private network. Neither HTTP redirects nor ambient proxies may move it.
+        with httpx.Client(follow_redirects=False, trust_env=False, timeout=60.0,
+                          verify=resolve_httpx_verify()) as client:
+            try:
+                response = client.post(f"{self.api_url}{path}", json=payload, headers=headers)
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise ValueError(f"Configured Firecrawl API refused the scrape (HTTP {exc.response.status_code})") from None
+            except httpx.RequestError:
+                raise ValueError("Configured Firecrawl API could not be reached") from None
+            return response.json()
+
+
+
 def _get_firecrawl_gateway_url() -> str:
     return _gateway.build_vendor_gateway_url("firecrawl")
 
@@ -213,6 +240,10 @@ def _get_firecrawl_client(capability: Optional[str] = None) -> Any:
         logger.error("Firecrawl client initialization failed: %s", log)
         raise ValueError(message())
     client_mode, kwargs, client_config = resolved
+    if capability == "extract" and client_config[0] == "direct" and kwargs.get("api_url"):
+        # Bind the routed profile's endpoint and key as one local value. No
+        # process-wide SDK client can be exchanged by a concurrent profile.
+        return _SelfHostedFirecrawlClient(**kwargs)
     cached = getattr(wt, "_firecrawl_client", None)
     if cached is not None and getattr(wt, "_firecrawl_client_config", None) == client_config:
         return cached
@@ -322,11 +353,11 @@ async def _scrape_one(url: str, formats: list[str], format: Optional[str]) -> di
         metadata.setdefault("sourceURL", metadata.get("source_url") or url)
         title, final_url = metadata.get("title", ""), _final_url(metadata, url)
         if not is_safe_url(final_url):
-            logger.info("Blocked redirected web_extract for unsafe final URL: %s", final_url)
-            return _error_entry(final_url, _UNSAFE_REDIRECT_MSG, title=title, raw=True)
+            logger.info("Blocked redirected web_extract for an unsafe final URL")
+            return _error_entry(url, _UNSAFE_REDIRECT_MSG, raw=True)
         if final_blocked := check_website_access(final_url):
             logger.info("Blocked redirected web_extract for %s by rule %s", final_blocked["host"], final_blocked["rule"])
-            return _error_entry(final_url, final_blocked["message"], title=title, raw=True, blocked=final_blocked)
+            return _error_entry(final_url, final_blocked["message"], raw=True, blocked=final_blocked)
         markdown, html = payload.get("markdown"), payload.get("html")
         content = markdown if format == "markdown" or (format is None and markdown) else html or markdown or ""
         entry = {"url": final_url, "title": title, "content": content, "raw_content": content, "metadata": metadata}

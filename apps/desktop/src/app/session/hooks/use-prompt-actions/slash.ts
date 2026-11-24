@@ -1,4 +1,8 @@
 import { skillInvocationText } from '@hermes/shared'
+import { safeGatewayWakeDiagnostics } from '@/lib/wake-trace'
+import { allowWakeTraceActivation, runBoundedWakeTrace } from '@/lib/wake-trace-run'
+import { stopClientCapture } from '@/store/wake-word'
+import { readClientWakeDiagnostics } from '@/store/wake-word'
 import { mergeUsage, parseCommandDispatch, parseSlashCommand, randomUuid } from '@hermes/shared'
 import { type MutableRefObject, useCallback, useRef } from 'react'
 
@@ -115,7 +119,10 @@ const renderWakeStatus = (status: WakeStatusResponse): string => {
     `Phrase: "${status.phrase?.trim() || 'hey hermes'}"`,
     `Provider: ${status.provider?.trim() || 'unknown'}`,
     `Surface: ${status.owner_surface?.trim() || status.configured_surface?.trim() || 'auto'}`,
-    `Input: ${wakeDeviceLabel(status.input_device)}`
+    `Input: ${wakeDeviceLabel(status.input_device)}`,
+    `Diagnostic owner: ${status.owned_by_caller ? 'caller' : 'not caller'}`,
+    `Client counters: ${JSON.stringify(readClientWakeDiagnostics())}`,
+    `Gateway counters: ${JSON.stringify(safeGatewayWakeDiagnostics(status.diagnostics))}`
   ]
 
   if (status.audio_silent) {
@@ -1078,8 +1085,8 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           const { render: renderSlashOutput } = resolved
           const requested = ctx.arg.trim().toLowerCase()
 
-          if (requested && !['on', 'off', 'status'].includes(requested)) {
-            renderSlashOutput('usage: /wake [on|off|status]')
+          if (requested && !['on', 'off', 'status', 'trace'].includes(requested)) {
+            renderSlashOutput('usage: /wake [on|off|status|trace]')
 
             return
           }
@@ -1104,7 +1111,31 @@ export function useSlashCommand(deps: SlashCommandDeps) {
               action = (await status()).listening ? 'off' : 'on'
             }
 
+            if (action === 'trace') {
+              const beforeStatus = await status()
+              if (beforeStatus.owner_surface && !beforeStatus.owned_by_caller) {
+                throw new Error('Another connection owns wake; diagnostic was not started')
+              }
+              const before = { client: readClientWakeDiagnostics(), gateway: safeGatewayWakeDiagnostics(beforeStatus.diagnostics) }
+              await runBoundedWakeTrace({
+                start: async () => {
+                  const started = await requestGateway<WakeStartResponse>('wake.start',
+                    { persist: true, surface: 'gui', client_capture: true }, 10_000)
+                  if (!started?.started) throw new Error('Wake diagnostic listener did not start')
+                  applyWakeStartResult(started)
+                  renderSlashOutput('Wake diagnostic running for 20 seconds. Say Hey Jarvis once. Capture stops automatically.')
+                },
+                stopRemote: async () => applyWakeStopResult(await requestGateway<WakeStopResponse>('wake.stop', { persist: true })),
+                stopCapture: stopClientCapture
+              })
+              const after = await status()
+              const shutdown = !after.listening && !after.owner_surface && !after.enabled
+              renderSlashOutput(`Wake diagnostic ended; browser stop requested; server shutdown ${shutdown ? 'verified' : 'NOT VERIFIED'}.\nBefore counters: ${JSON.stringify(before)}\n${renderWakeStatus(after)}`)
+              return
+            }
+
             if (action === 'on') {
+              allowWakeTraceActivation()
               const started = await requestGateway<WakeStartResponse>(
                 'wake.start',
                 { persist: true, surface: 'gui', client_capture: true },
@@ -1126,7 +1157,9 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
             renderSlashOutput(renderWakeStatus(await status()))
           } catch (err) {
-            renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
+            renderSlashOutput(requested === 'trace'
+              ? 'Wake diagnostic failed; browser capture stop requested. Server shutdown requires verification. Error payload omitted.'
+              : `error: ${err instanceof Error ? err.message : String(err)}`)
           }
         },
         // /handoff hands this session to a messaging platform. The platform is

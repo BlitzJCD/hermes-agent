@@ -733,7 +733,7 @@ _URL_BARE_TOKEN_RE = re.compile(
 )
 
 # JWTs always start with "eyJ" (base64 "{"); 1-, 2- and 3-part forms.
-_JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_=-]{4,}){0,2}")
+_JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_=-]{4,}){1,2}")
 
 # Links ``hermes webapp`` prints that sign a browser in as the user: the gateway's browser credential
 # after ``hermes-session=`` and the one-use ticket of a ``/webapp/launch`` link. Both values are

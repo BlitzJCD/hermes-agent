@@ -2121,61 +2121,15 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
     return [(row["id"], row["status"]) for row in rows]
 
 
-def _claim_and_open_run(
-    conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
-    *, event_extra: Optional[dict] = None,
-) -> Optional[int]:
-    """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
-    when the CAS lost. Caller holds the txn."""
-    cur = conn.execute(
-        f"""
-        UPDATE tasks
-           SET status        = 'running',
-               claim_lock    = ?,
-               claim_expires = ?,
-               started_at    = COALESCE(started_at, ?)
-         WHERE id = ?
-           AND status = '{source_status}'
-           AND claim_lock IS NULL
-        """,
-        (lock, expires, now, task_id),
-    )
-    if cur.rowcount != 1:
-        return None
-    trow = conn.execute(
-        "SELECT assignee, max_runtime_seconds, current_step_key "
-        "FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone()
-    run_cur = conn.execute(
-        """
-        INSERT INTO task_runs (
-            task_id, profile, step_key, status,
-            claim_lock, claim_expires, max_runtime_seconds,
-            started_at
-        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
-        """,
-        (
-            task_id, trow["assignee"] if trow else None, trow["current_step_key"] if trow else None,
-            lock, expires, trow["max_runtime_seconds"] if trow else None, now,
-        ),
-    )
-    run_id = run_cur.lastrowid
-    conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, task_id))
-    _append_event(
-        conn, task_id, "claimed",
-        {"lock": lock, "expires": expires, "run_id": run_id, **(event_extra or {})}, run_id=run_id,
-    )
-    return run_id
-
-
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, manual: bool = False,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
+    already claimed, outside ``ready``, or denied admission. An explicit
+    manual claim starts a fresh retry budget and keeps every prior run.
     """
     now = int(time.time())
     lock = claimer or _claimer_id()
@@ -2191,11 +2145,7 @@ def claim_task(
             )
             _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
             return None
-        # Close a leaked prior run so the CAS below doesn't strand it.
-        _reclaim_dangling_run(
-            conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
-        )
-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
+        run_id = claim_and_open_run(conn, task_id, "ready", lock, expires, now, manual=manual)
         if run_id is None:
             return None
         claimed = get_task(conn, task_id)
@@ -2225,7 +2175,7 @@ def claim_review_task(
                     {"reason": "parent_reopened", "source_status": "review"},
                 )
             return None
-        run_id = _claim_and_open_run(
+        run_id = claim_and_open_run(
             conn, task_id, "review", lock, expires, now, event_extra={"source_status": "review"},
         )
         if run_id is None:
@@ -2485,10 +2435,17 @@ def reclaim_task(
     if row["status"] != "running" and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
         return False
+    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked
+    if owner_reclaim_blocked(conn, task_id):
+        return False
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
+    if _worker_survived_termination(termination):
+        return False
     with write_txn(conn):
+        if owner_reclaim_blocked(conn, task_id):
+            return False
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -2503,6 +2460,7 @@ def reclaim_task(
             error=f"manual_reclaim: {reason}" if reason else f"manual_reclaim lock={prev_lock}",
             payload={"manual": True, "reason": reason, "prev_lock": prev_lock, "retry_status": retry_status},
         )
+        _authorize_dispatch(conn, task_id, "manual_reclaim")
     # Operator intervention = fresh retry budget (own txn, runs after commit).
     _clear_failure_counter(conn, task_id)
     return True
@@ -3378,6 +3336,8 @@ def request_review(
             if staged:
                 payload["artifacts"] = staged
             _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
+            if run_id is None:
+                _authorize_dispatch(conn, task_id, "review_requested", lane="review")
     except Exception:
         if staged_copies:
             _discard_staged_copies(staged_copies, staged_copies[0].parent)
@@ -3520,6 +3480,7 @@ def promote_task(
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
         _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
+        _authorize_dispatch(conn, task_id, "manual_promote")
 
     return True, None
 
@@ -3554,7 +3515,7 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(conn: sqlite3.Connection, task_id: str, *, operator: bool = True) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
@@ -3579,7 +3540,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # resetting them is the amnesia that let cron-unblock <-> re-block loop
         # unbounded; only complete_task clears them. ``consecutive_failures``
         # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
-        # is a fresh start for the retry budget.
+        # may reset the breaker. Only an operator starts a new dispatch budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
@@ -3595,6 +3556,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 else None
             ),
         )
+        if operator:
+            _authorize_dispatch(conn, task_id, "manual_unblock")
         return True
 
 
@@ -3631,6 +3594,7 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         _append_event(
             conn, task_id, "review_reopened", payload if payload != {"status": "ready"} else None,
         )
+        _authorize_dispatch(conn, task_id, "review_reopened")
         return True
 
 
@@ -3696,6 +3660,8 @@ def invalidate_descendants_for_parent_reopen(
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                 "current_run_id = NULL, consecutive_failures = 0 WHERE id = ?", (row["id"],),
             )
+            if previous_status == "done":
+                _authorize_dispatch(conn, row["id"], "ancestor_reopened")
             entry = {
                 "id": row["id"], "prior_status": previous_status,
                 "new_status": "todo", "resume_status": resume_status,
@@ -4011,7 +3977,7 @@ def _retention_seconds(older_than_seconds: int) -> int:
 
 
 def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600) -> int:
-    """Prune old done/archived events, retaining decomposition identity until task deletion.
+    """Prune old done/archived events while retaining decomposition and admission identity.
 
     ``older_than_seconds=0`` means everything older than now; the CLI maps
     ``--event-retention-days 0`` to "disabled" before calling this.
@@ -4019,7 +3985,9 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
     cutoff = int(time.time()) - _retention_seconds(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
+            "DELETE FROM task_events WHERE created_at < ? "
+            "AND kind NOT IN ('decomposed', 'owner_admitted', 'dispatch_authorized', 'archived') "
+            "AND NOT (kind = 'completed' AND run_id IS NULL) AND task_id IN "
             "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
         )
     return int(cur.rowcount or 0)
@@ -4204,6 +4172,10 @@ from hermes_cli.kanban_db_boards import (
     read_board_metadata,
     remove_board,
     write_board_metadata,
+)
+from hermes_cli.kanban_dispatch_admission import (
+    authorize_dispatch as _authorize_dispatch,
+    claim_and_open_run,
 )
 from hermes_cli.kanban_db_connect import (
     _INITIALIZED_PATHS,

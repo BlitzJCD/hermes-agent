@@ -19,7 +19,12 @@ BLOCKED = "https://blocked.example/secret"
 
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
-    cache_dir = tmp_path / "cache" / "web"
+    home = tmp_path / "user-home"
+    state = tmp_path / "hermes-state"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(state))
+    cache_dir = state / "cache" / "web"
     cache_dir.mkdir(parents=True)
     monkeypatch.setattr(wrc, "_cache_dir", lambda: cache_dir)
     monkeypatch.setattr(wrc, "_web_config", dict)
@@ -68,7 +73,8 @@ def test_keenable_redirect_into_a_blocked_host_is_refused_and_never_cached(monke
         result = _extract(provider)[0]
         assert result["content"] == "" and "TARGET PAGE" not in str(result)
         assert result["blocked_by_policy"] == {"host": "blocked.example", "rule": "blocked.example", "source": "config"}
-        assert result["url"] == BLOCKED and result["error"].startswith("Blocked")
+        assert result["url"] == REDIRECTOR and result["error"].startswith("Blocked")
+        assert result["title"] == ""
     # Nothing was cached, so no hit is ever refused into a paid re-fetch of a page we will not serve.
     assert wrc.extract_cache_get(REDIRECTOR, provider="keenable") is None
     assert len(calls) == 3

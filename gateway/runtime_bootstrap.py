@@ -9,6 +9,7 @@ import time
 _PURPOSE_CAPABILITIES = {
     'interactive': frozenset({'session:create', 'session:read', 'session:submit',
                               'session:control', 'session:approve', 'session:respond'}),
+    'interactive-create-only': frozenset({'session:create', 'session:read'}),
     'native-http': frozenset({'http:owner'}),
     # Same-user host operation, not permission to read or mutate another profile.
     'native-profile-create': frozenset({'profiles:create'}),

@@ -13,6 +13,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from hermes_constants import get_hermes_home, hermes_home_key
 from utils import atomic_write_text
 from tools.threat_patterns import first_threat_message as _first_threat_message
 
@@ -187,6 +188,7 @@ class MemoryStore:
 
     def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375, *,
                  memory_enabled: bool = True, user_profile_enabled: bool = True):
+        self._profile_key = hermes_home_key()
         self.memory_entries: list[str] = []
         self.user_entries: list[str] = []
         self.memory_char_limit, self.user_char_limit = memory_char_limit, user_char_limit
@@ -225,13 +227,17 @@ class MemoryStore:
         Threat hits are replaced by a ``[BLOCKED: …]`` placeholder in the SNAPSHOT only;
         live lists keep the raw text so the user can see and remove poisoned entries
         (dropping them silently would hide the attack)."""
+        from agent.redact import redact_sensitive_text
         from tools.threat_patterns import scan_for_threats
+        from tools.write_approval import memory_owner_approval_required
+
+        owner_review = memory_owner_approval_required()
 
         def _sanitize(entry, filename):
             # Strict scope, same as writes; empty / already-blocked entries pass through.
             findings = scan_for_threats(entry, scope="strict") if entry and not entry.startswith("[BLOCKED:") else None
             if not findings:
-                return entry
+                return redact_sensitive_text(entry, force=True, redact_url_credentials=True) if owner_review else entry
             logger.warning("Memory entry from %s blocked at load time: %s", filename, ", ".join(findings))
             return (f"[BLOCKED: {filename} entry contained threat pattern(s): {', '.join(findings)}. "
                     f"Removed from system prompt; use memory(action=remove, target='{_store_target(filename)}') "
@@ -297,10 +303,19 @@ class MemoryStore:
                 with suppress(OSError):
                     _flock(True)
 
-    @staticmethod
-    def _path_for(target: str) -> Path:
-        from tools import memory_tool  # get_memory_dir is monkeypatched there
-        return memory_tool.get_memory_dir() / ("USER.md" if target == "user" else "MEMORY.md")
+    def matches_active_profile(self) -> bool:
+        return self._profile_key == hermes_home_key()
+
+    def _path_for(self, target: str) -> Path:
+        from tools import memory_tool, write_approval
+
+        if not self.matches_active_profile():
+            raise ValueError("Memory store belongs to another profile.")
+        path = memory_tool.get_memory_dir() / ("USER.md" if target == "user" else "MEMORY.md")
+        if write_approval.memory_owner_approval_required():
+            if path.resolve() != get_hermes_home().resolve() / "memories" / path.name:
+                raise ValueError("Memory path escapes its profile.")
+        return path
 
     def _entries_for(self, target: str) -> list[str]:
         return self.user_entries if target == "user" else self.memory_entries
@@ -649,6 +664,8 @@ class MemoryStore:
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """Frozen load-time snapshot (NOT live state — mid-session writes don't touch
         it, preserving the prefix cache); None if empty."""
+        if not self.matches_active_profile():
+            return None
         return self._system_prompt_snapshot.get(target, "") or None
 
     def _success_response(self, target: str, message: str | None = None, **extra) -> dict[str, Any]:

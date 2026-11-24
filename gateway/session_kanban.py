@@ -32,6 +32,7 @@ def build_kanban_policy(connection, params, config):
             task = kb.get_task(conn, params['task_id'])
             run = conn.execute('SELECT * FROM task_runs WHERE id=?', (params['run_id'],)).fetchone()
             if (task is None or run is None or task.status != 'running' or run['status'] != 'running'
+                    or run['ended_at'] is not None
                     or task.current_run_id != params['run_id'] or run['task_id'] != task.id
                     or task.claim_lock != params['claim_lock'] or run['claim_lock'] != task.claim_lock):
                 raise RuntimeStoreError('stale_kanban_claim')
@@ -73,7 +74,6 @@ def build_kanban_policy(connection, params, config):
 async def run_task(connection, params):
     if not connection.native_owner or 'session:create' not in connection.actor.capabilities:
         raise RuntimeStoreError('permission_denied')
-    from gateway.run import _load_gateway_config
     from gateway.session_local import create_local_session
     from gateway.session_contract import Submission
     from gateway.session_local_recovery import local_identity
@@ -98,6 +98,8 @@ async def run_task(connection, params):
         from gateway.session_local_recovery import restore_local_session
         ref = restore_local_session(authority, sid)
     else:
+        from gateway.run import _load_gateway_config
+
         policy, private = build_kanban_policy(connection, params, _load_gateway_config())
         ref = create_local_session(authority, connection.actor, {'request_id': request_id},
                                    trusted_policy=policy, trusted_secrets=private)
@@ -112,25 +114,29 @@ async def run_task(connection, params):
         # The Kanban DB is the cross-profile dispatch bus (busy_timeout up to 120 s): the claim
         # check and its marker share one write transaction, off the owner loop.
         with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
-            # Either this exact attempt was already admitted to this session (retry after a
-            # crash between session creation and admission), or the claim is still current
-            # now; a reclaimed/closed task never reaches resume/submit.
+            # A marker can precede the owner ledger commit. A closed claim may return
+            # its existing admission receipt, but cannot use the marker to start work.
             marker = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='owner_admitted' ORDER BY id DESC LIMIT 1",
                                   (params['task_id'], params['run_id'])).fetchone()
+            current = conn.execute(
+                "SELECT 1 FROM tasks AS t JOIN task_runs AS r ON r.id = t.current_run_id "
+                "WHERE t.id = ? AND r.id = ? AND t.claim_lock = ? AND r.claim_lock = t.claim_lock "
+                "AND r.task_id = t.id AND t.status = 'running' AND r.status = 'running' AND r.ended_at IS NULL",
+                (params['task_id'], params['run_id'], params['claim_lock']),
+            ).fetchone() is not None
             if marker:
                 if json.loads(marker[0])['session_id'] != ref.session_id:
                     raise RuntimeStoreError('stale_kanban_claim')
             else:
-                task = kb.get_task(conn, params['task_id'])
-                if not (task and task.status == 'running' and task.current_run_id == params['run_id'] and task.claim_lock == params['claim_lock']):
+                if not current:
                     raise RuntimeStoreError('stale_kanban_claim')
-                kb._append_event(conn, task.id, 'owner_admitted',
+                kb._append_event(conn, params['task_id'], 'owner_admitted',
                     {'db': owner_db, 'session_id': ref.session_id,
                      'request_id': request_id, 'pid': os.getpid(), 'birth': worker_birth(psutil.Process())},
-                    run_id=task.current_run_id)
+                    run_id=params['run_id'])
+            return current
     from gateway.session_runtime_workers import tracked_write
-    await tracked_write(authority, admit_claim)
-    await connection.resume(ref, {})
+    current = await tracked_write(authority, admit_claim)
     # Finite like the `chat -q` worker it replaced: nobody can answer an approval or clarify in a
     # card (approvals.single_query_mode applies). Never unattended: that is `-z`'s auto-approval.
     # A retry of an attempt admitted before cards were finite resubmits its committed payload,
@@ -138,6 +144,9 @@ async def run_task(connection, params):
     from hermes_state_runtime import find_session_admission
     committed = None if not saved else await asyncio.to_thread(find_session_admission, authority.db,
         principal_id=connection.actor.subject, session_id=ref.session_id, request_id=request_id)
+    if not current and committed is None:
+        raise RuntimeStoreError('stale_kanban_claim')
+    await connection.resume(ref, {})
     payload: dict = {'text': f'work kanban task {params["task_id"]}'}
     if committed is None or 'finite' in committed['payload']:
         payload['finite'] = True

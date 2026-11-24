@@ -490,7 +490,8 @@ def _wake_probe(cfg: dict, params: dict, surface: str) -> tuple[str, dict]:
 def _wake_detect_handler(transport, sid: str, phrase: str, new_session: bool):
     """On-detect callback: pause, verify ownership, emit ``wake.detected`` on the owner's transport."""
     def _on_detect() -> None:
-        from tools.wake_word import get_last_match, owns_listener, pause_listening
+        from tools.wake_word import get_diagnostic_trace, get_last_match, owns_listener, pause_listening
+        trace = get_diagnostic_trace(owner=transport)
         if not pause_listening(owner=transport) or not owns_listener(transport):
             return
         if _transport_is_dead(transport):
@@ -502,10 +503,19 @@ def _wake_detect_handler(transport, sid: str, phrase: str, new_session: bool):
                     sid, type(transport).__name__, matched_profile)
         token = bind_transport(transport)
         try:
-            _emit("wake.detected", sid, {
+            if trace is not None:
+                trace.bump("event_attempts")
+            emitted = _emit("wake.detected", sid, {
                 "phrase": matched_phrase or phrase, "profile": matched_profile or None,
                 # detached-spawn: ok — not a spawn: a wake.detected event field
                 "start_new_session": new_session})
+            if trace is not None:
+                trace.bump("event_emitted" if emitted is True else
+                           "event_refused" if emitted is False else "event_unknown")
+        except Exception:
+            if trace is not None:
+                trace.bump("event_errors")
+            raise
         finally:
             reset_transport(token)
     return _on_detect
@@ -650,7 +660,7 @@ def _(rid, params: dict) -> dict:
     try:
         from tools.wake_word import (
             audio_is_silent, detector_frame_info, get_input_device_status, is_listening,
-            load_wake_word_config, owns_listener, silent_audio_hint)
+            load_wake_word_config, owns_listener, silent_audio_hint, diagnostic_snapshot)
         cfg = load_wake_word_config()
         probe_capture, reqs = _wake_probe(cfg, params, str(params.get("surface") or "").strip().lower())
         owner, owner_surface = _wake_owner_snapshot()
@@ -673,6 +683,7 @@ def _(rid, params: dict) -> dict:
         # `enabled` is config truth (clients re-arm after a voice turn from it); `audio_silent` =
         # armed but deaf despite an open stream (see the platform-specific hint).
         return _ok(rid, {
+            "diagnostics": diagnostic_snapshot(owner=_caller_transport()),
             "listening": listening, "owned_by_caller": owned_by_caller,
             "owner_surface": owner_surface if owner is not None else None,
             "phrase": reqs["phrase"], "provider": reqs["provider"],

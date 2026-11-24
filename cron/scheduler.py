@@ -3286,7 +3286,10 @@ def _run_one_job_body(
     job = dict(job, execution_id=execution_id)
     # The execution id is resolved BEFORE the fence so ``hermes cron cancel`` can join the same
     # cancel seam: the marker it writes is polled by whichever process owns this attempt.
-    fence = _FireOwnership(job, claim_lost, transport_cancel, CancelRequest(execution_id))
+    from agent.estop import CronStop
+
+    operator_cancel = _CombinedCancelEvent(CancelRequest(execution_id), CronStop())
+    fence = _FireOwnership(job, claim_lost, transport_cancel, operator_cancel)
     fire_owner = fence.owner
     _side_effect_fence = fence.side_effect_fence
     _fire_claim_ownership_lost = fence.lost
@@ -4224,7 +4227,10 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     """Run one due job via the shared ``run_one_job`` body."""
     # Claim only when the worker actually starts, so a queued lease can't expire first.
     try:
-        claimed = claim_job_for_fire(job["id"], return_job=True)
+        claimed = claim_job_for_fire(
+            job["id"], return_job=True, execution_id=job["execution_id"],
+            expected_occurrence=job.get("_scheduled_instant"),
+        )
     except OSError as exc:
         store_health.note_unwritable(exc, f"skipped job '{job.get('name') or job['id']}'", "claim", [job])
         settle_unstarted_execution(
@@ -4235,8 +4241,10 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
             job["execution_id"], job["id"], f"Fire claim failed: {type(exc).__name__}: {exc}")
         raise
     if not claimed:
-        finish_execution(
-            job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
+        settle_unstarted_execution(
+            job["execution_id"], job["id"], "Fire claim lost; execution was not started.")
+        if job.get("run_claim"):
+            clear_run_claim(job["id"], expected_claim=job["run_claim"])
         return True
     # CAS returns the persisted record; bool fallback only for older test doubles.
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)

@@ -1156,14 +1156,19 @@ class GatewayBusySessionMixin:
         from agent import estop
         args = (event.get_command_args() or "").strip()
         if args.lower() in {"off", "resume", "stop", "disengage"}:
-            if estop.disengage():
+            lifted, errors = estop.disengage_checked()
+            if errors:
+                return "\n".join(errors)
+            if lifted:
                 return t("gateway.pause.resumed")
             return t("gateway.pause.not_paused")
         state = estop.get_state()
-        if state is not None and not args:
+        if state is not None and not state["errors"] and not args:
             suffix = t("gateway.pause.reason_suffix", reason=state.get("reason")) if state.get("reason") else ""
             return t("gateway.pause.already_paused", suffix=suffix)
-        estop.engage(reason=args or None)
+        _, errors = estop.engage_checked(reason=args or None)
+        if errors:
+            return "\n".join(errors)
         suffix = t("gateway.pause.reason_suffix", reason=args) if args else ""
         return t("gateway.pause.paused", suffix=suffix)
 

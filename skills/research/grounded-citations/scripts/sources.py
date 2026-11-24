@@ -398,12 +398,36 @@ def _sentences(prose: str) -> list[str]:
     return out
 
 
+def _verify_block_quotes(prose: str, sources: dict[int, dict[str, Any]]) -> list[str]:
+    """Bind each Markdown blockquote to exact evidence attached to its trailing citations."""
+    blocks = re.findall(r"(?:^ {0,3}>[^\n]*(?:\n|$))+", prose, re.MULTILINE)
+    if not blocks:
+        return ["no Markdown blockquotes found for quote verification"]
+    errors = []
+    for number, block in enumerate(blocks, start=1):
+        body = " ".join(line.lstrip()[1:].strip() for line in block.splitlines())
+        trailing = re.search(r"(?:\s*\[\d{1,4}\])+\s*$", body)
+        if trailing is None:
+            errors.append(f"blockquote {number} needs trailing source citations")
+            continue
+        ids = [int(match) for match in _CITE_RE.findall(trailing.group())]
+        quote = _match_key(body[:trailing.start()])
+        if not quote or not any(
+            quote == _match_key(evidence.get("text", ""))
+            for sid in ids
+            for evidence in sources.get(sid, {}).get("quotes", [])
+        ):
+            errors.append(f"blockquote {number} does not match evidence attached to its cited sources")
+    return errors
+
+
 def verify_draft(
     draft_path: Path,
     sources: list[dict[str, Any]],
     strict: bool = False,
     min_coverage: float | None = None,
     require_evidence: bool = False,
+    verify_quotes: bool = False,
 ) -> tuple[int, list[str], list[str]]:
     """Return (exit_code, errors, warnings)."""
     text = draft_path.read_text(encoding="utf-8")
@@ -478,6 +502,9 @@ def verify_draft(
                 "cited sources carry no verbatim evidence quote (run `quote` with the "
                 "fetched page text): " + ", ".join(f"[{i}]" for i in unevidenced)
             )
+
+    if verify_quotes:
+        errors.extend(_verify_block_quotes(prose, by_id))
 
     over_cited = [s for s in sentences if len(_CITE_RE.findall(s)) > 3]
     if over_cited:
@@ -566,6 +593,12 @@ def main(argv: list[str] | None = None) -> int:
         "--evidence",
         action="store_true",
         help="require every cited source to carry at least one verbatim quote",
+    )
+
+    p_ver.add_argument(
+        "--quotes",
+        action="store_true",
+        help="verify Markdown blockquotes against evidence attached to their trailing citations",
     )
 
     args = parser.parse_args(argv)
@@ -661,6 +694,7 @@ def main(argv: list[str] | None = None) -> int:
             strict=args.strict,
             min_coverage=args.min_coverage,
             require_evidence=args.evidence,
+            verify_quotes=args.quotes,
         )
         for w in warnings:
             prefix = "info" if w.startswith("stats: ") else "warn"

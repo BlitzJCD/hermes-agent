@@ -509,38 +509,21 @@ def test_migration_backfills_inflight_run_for_legacy_db(kanban_home):
 
 
 
-def test_claim_task_recovers_from_invariant_leak(kanban_home):
-    """Belt-and-suspenders: if a prior run somehow leaked (stranded
-    current_run_id on a ready task), claim_task should recover rather
-    than strand it further."""
-    conn = kbc.connect()
-    try:
+def test_claim_task_holds_ready_card_with_an_unresolved_run(kanban_home):
+    """An inconsistent ready card may still have an outstanding admission."""
+    with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="invariant test", assignee="worker")
-        # Manually engineer the invariant violation: create a run, then
-        # flip status back to 'ready' without closing the run.
-        kb.claim_task(conn, tid)
-        leaked_run_id = kb.latest_run(conn, tid).id
-        conn.execute(
-            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-            "claim_expires = NULL "
-            "WHERE id = ?", (tid,),
-        )
-        conn.commit()
-        # The leaked run is still open.
-        assert kb.get_run(conn, leaked_run_id).ended_at is None
+        original = kb.claim_task(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL WHERE id = ?", (tid,),
+            )
 
-        # Now re-claim — the defensive recovery must close the leak.
-        claimed = kb.claim_task(conn, tid)
-        assert claimed is not None
-        leaked = kb.get_run(conn, leaked_run_id)
-        assert leaked.ended_at is not None
-        assert leaked.outcome == "reclaimed"
-        # New run opened and pointed to.
-        new_run = kb.latest_run(conn, tid)
-        assert new_run.id != leaked_run_id
-        assert new_run.ended_at is None
-    finally:
-        conn.close()
+        assert kb.claim_task(conn, tid) is None
+        assert kb.claim_task(conn, tid, manual=True) is None
+        assert kb.get_run(conn, original.current_run_id).ended_at is None
+        assert [run.id for run in kb.list_runs(conn, tid)] == [original.current_run_id]
 
 
 # -------------------------------------------------------------------------
@@ -1234,7 +1217,7 @@ def _drive_nonzero_crash(conn, tid, fake_pid):
 
 
 @pytest.mark.platforms("linux")
-def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
+def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home, monkeypatch):
     """Mixed failure kinds must not consume the violation retry budget.
 
     Regression for the #61233 review finding: expressed as a plain
@@ -1244,6 +1227,9 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
     retries, and below-budget violations must leave the unified counter
     untouched (so the two budgets stay independent).
     """
+    # Keep the global admission ceiling above this test's four attempts so
+    # the protocol-specific breaker is the guard under test.
+    monkeypatch.setattr("hermes_cli.kanban_dispatch_admission.MAX_DISPATCH_ATTEMPTS", 4)
     from hermes_cli import kanban_db_dispatch as _kbd
     conn = kbc.connect()
     try:

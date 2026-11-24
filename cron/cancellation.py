@@ -170,14 +170,14 @@ def cancel_reason(cancel_event: Any) -> str:
     return getattr(cancel_event, "reason", None) or "cron fire ownership was lost"
 
 
-def finish_cancelled_run(job: dict[str, Any], execution_id: str, fire_owner: Optional[str]) -> None:
+def finish_cancelled_run(job: dict[str, Any], execution_id: str, fire_owner: Optional[str], *, reason: str | None = None) -> None:
     """Book an operator-cancelled run: ledger row ``cancelled`` with the recorded reason, and the
     job's ``last_status`` — without a failure alert or a failure-streak bump, since the operator
     asked for it. A job removed mid-run has no record left to mark; its ledger row still lands."""
     from cron import scheduler
     from cron.unreachable_retry import is_retry_run
 
-    reason = CancelRequest(execution_id).reason
+    reason = reason or CancelRequest(execution_id).reason
     if not scheduler.self_removal_delivery_allowed(job["id"]):
         owner = {"expected_fire_owner": fire_owner} if fire_owner is not None else {}
         # A stopped ladder re-run re-ran an occurrence that already counted: no second repeat slot.
@@ -207,17 +207,20 @@ def run_job_unless_cancelled(run_job, job, run_kwargs, teardown, fence, executio
     ``run_job`` hands the agent back even when raising, so ``teardown`` runs on every path
     (BaseException, so KeyboardInterrupt/SystemExit mid-run still tear down)."""
     try:
-        result = run_job(job, **run_kwargs)
+        if not fence.operator_cancelled():
+            result = run_job(job, **run_kwargs)
+        else:
+            result = None
     except BaseException as exc:
         teardown()
         if not (isinstance(exc, Exception) and fence.operator_cancelled()):
             raise
-        finish_cancelled_run(job, execution_id, fire_owner)
+        finish_cancelled_run(job, execution_id, fire_owner, reason=cancel_reason(fence.operator_cancel))
         return None
     if not fence.operator_cancelled():
         return result
     teardown()
-    finish_cancelled_run(job, execution_id, fire_owner)
+    finish_cancelled_run(job, execution_id, fire_owner, reason=cancel_reason(fence.operator_cancel))
     return None
 
 

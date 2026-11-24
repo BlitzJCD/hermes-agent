@@ -381,6 +381,9 @@ def load_env_file(env_path: Path) -> dict[str, str]:
     returns a fresh dict: callers mutate what they get back (``build_profile_secret_scope`` layers
     external secrets over it).
     """
+    if not env_path.exists():
+        invalidate_env_file_cache(env_path)
+        return {}
     key = str(env_path)
     try:
         with open(env_path, "rb") as handle:

@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, UTC
 from pathlib import Path
 from agent.deadline import poll_until
 from hermes_constants import get_hermes_home
-from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM, FIRE_CLAIM_SKEW_SECONDS, FIRE_CLAIM_TTL_SECONDS
+from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM, FIRE_CLAIM_TTL_SECONDS
 from cron.env_settings import cron_env_setting
 from cron.jobs_invariants import _validate_job_mode_invariants, validate_schedule_knobs
 from cron.jobs_model_pin import _main_model_pin
@@ -2649,7 +2649,7 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
     return _with_job(job_id, apply, False)
 
 
-def clear_run_claim(job_id: str) -> bool:
+def clear_run_claim(job_id: str, *, expected_claim: Optional[dict] = None) -> bool:
     """Clear a one-shot's ``run_claim`` when dispatch itself fails: such a job never reaches
     mark_job_run, so the stale claim would block re-dispatch until the TTL expires.
 
@@ -2658,6 +2658,8 @@ def clear_run_claim(job_id: str) -> bool:
     """
     def apply(jobs, _i, job):
         claim = job.get("run_claim")
+        if expected_claim is not None and claim != expected_claim:
+            return False
         if job.get("schedule", {}).get("kind") != "once" or claim in (None, {"outage": True}):
             return False  # recurring, already cleared, or already reduced to the outage marker
         # Keep the outage marker (no "at": a stale claim, so it re-dispatches) or the skipped
@@ -2723,6 +2725,7 @@ def _machine_id() -> str:
 def claim_job_for_fire(
     job_id: str, *, claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS, force: bool = False,
     manual: bool = False, return_job: bool = False,
+    execution_id: Optional[str] = None, expected_occurrence: Optional[str] = None,
 ) -> bool | dict[str, Any]:
     """Atomically claim a job for one external 'fire' (multi-machine at-most-once); True iff THIS
     caller won (``CronScheduler.fire_due``: exactly one of N replicas runs a job). Under the
@@ -2741,36 +2744,29 @@ def claim_job_for_fire(
         if not force and not is_job_runnable(job):
             return False
         now = _hermes_now()
-        if _claim_is_live(job.get("fire_claim"), now, claim_ttl_seconds):
+        previous_claim = job.get("fire_claim")
+        if _claim_is_live(previous_claim, now, claim_ttl_seconds):
             return False  # someone holds a fresh claim
-        from cron.occurrences import completed_occurrence, scheduled_instant
+        if isinstance(previous_claim, dict) and previous_claim.get("execution_id"):
+            return False  # recovery must settle the exact receipt before replacing the lease
+        from cron.occurrences import occurrence_status, resolve_fire_occurrence
 
-        # ``manual`` (an off-tick run-now) must NOT stamp an occurrence identity: outside a
-        # scheduler tick ``next_run_at`` is the NEXT occurrence, not the one being run, so
-        # stamping it would make completed_occurrence() skip that slot when it arrives.
         manual_fire = force or manual or job.get("manual_run_at") == job.get("next_run_at")
-        instant = None if manual_fire else scheduled_instant(job.get("next_run_at"))
-        # A scheduled tick only ever fires when now >= next_run_at
-        # (_evaluate_due_job returns False while the stored occurrence is still
-        # in the future), so a claim arriving BEFORE the stored next occurrence
-        # cannot be the tick that owns it — it is a manual / dashboard / webhook
-        # fire and must stay occurrence-free. Binding it would make run_one_job
-        # stamp that FUTURE instant completed in the ledger: later manual fires
-        # are then refused ("Job is already being fired by the scheduler") and
-        # the scheduled tick dedupe-skips its real delivery (2026-09-08 live:
-        # a manual run at 19:53 consumed the next day's 19:00 occurrence).
-        # A claim within FIRE_CLAIM_SKEW_SECONDS of the slot is the fire for that slot
-        # (provider clock skew); dropping its identity would leave the slot unrecorded, so
-        # mark_job_run recomputes the same cron slot and the misfire backstop runs it twice.
-        if (instant is not None
-                and datetime.fromisoformat(instant) - now >= timedelta(seconds=FIRE_CLAIM_SKEW_SECONDS)):
-            instant = None
-        if instant and completed_occurrence(job, instant):
+        matches, instant = resolve_fire_occurrence(
+            job, now, manual=manual_fire, expected=expected_occurrence,
+        )
+        if not matches:
+            return False
+        disposition = occurrence_status(job, instant, execution_id=execution_id)
+        if disposition == "held":
+            return False
+        if disposition != "clear":
             if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
                 nxt = compute_next_run(
                     job["schedule"], now.isoformat(), timezone=job.get("timezone"))
                 if nxt:
                     job["next_run_at"] = nxt
+                    job.pop("pending_slot", None)
                     save_jobs(jobs)
             return False
         if force:
@@ -2778,6 +2774,8 @@ def claim_job_for_fire(
         # Per-acquisition token: a process may legitimately reclaim its own stale lease, and the
         # previous runner must not heartbeat the new claim merely because hostname + PID match.
         job["fire_claim"] = {"at": now.isoformat(), "by": f"{_machine_id()}:{uuid.uuid4().hex}"}
+        if execution_id is not None:
+            job["fire_claim"]["execution_id"] = execution_id
         # Claimed: the occurrence is now owned by a run (its ledger row + fire claim carry it).
         job.pop("pending_slot", None)
         if slot := extra_fire.pending_slot(job, now, manual_fire):
@@ -3204,9 +3202,12 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     # into both fields, and any rewrite of next_run_at (edit, re-anchor, fire-claim advance) must
     # invalidate the marker. Do not "fix" this with _ensure_aware normalization.
     manual_run = job.get("manual_run_at") == next_run
-    from cron.occurrences import completed_occurrence, scheduled_instant
+    from cron.occurrences import occurrence_status, scheduled_instant
 
-    if not manual_run and completed_occurrence(job, next_run):
+    disposition = "clear" if manual_run else occurrence_status(job, next_run)
+    if disposition == "held":
+        return False
+    if disposition != "clear":
         new_next = d.recompute_next() if recurring else None
         if new_next:
             scan.persist(job["id"], next_run_at=new_next)

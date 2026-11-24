@@ -172,8 +172,10 @@ async def get_health_idle(request: Request):
 @router.post("/api/health/retirement")
 async def post_health_retirement(request: Request):
     from hermes_cli.backend_retirement import retirement
+    from hermes_cli.web_session_ownership import require_session_operator
 
     _require_token(request)
+    require_session_operator(request)
     if _mounted_on_gateway(request):
         return {"ok": False, "idle": False, "reason": _GATEWAY_OWNS_LIFECYCLE}
     try:

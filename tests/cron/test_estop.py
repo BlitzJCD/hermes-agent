@@ -1,19 +1,17 @@
 """Global emergency stop (`hermes pause` / `hermes resume`) — agent/estop.py.
 
-The ESTOP sentinel is a resumable pause for NEW work only: cron dispatch,
-kanban dispatch, and new gateway turns are halted while it is engaged; work
-already in flight is never touched. Removing the sentinel (`hermes resume`)
-restores normal operation with no restart.
+The ESTOP sentinel holds new cron, kanban and gateway work. Active cron
+workers use the same control to observe cancellation. Resume reopens admission.
 
 Ported from: gastownhall/gastown estop.go (MIT); related prior art: #26778
-(/panic — kill/exit semantics, deliberately different) and #44617
-(interrupt in-flight cron — deliberately NOT done here).
+(/panic — kill/exit semantics) and #44617 (interrupt in-flight cron).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 import pytest
 
@@ -23,9 +21,14 @@ from agent import estop
 @pytest.fixture
 def hermes_home(tmp_path, monkeypatch):
     """Point HERMES_HOME at a temp dir and reset estop module log state."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    home = tmp_path / "user-home"
+    state = tmp_path / "hermes-state"
+    home.mkdir()
+    state.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(state))
     estop._logged_components.clear()
-    return tmp_path
+    return state
 
 
 # ── sentinel create / remove ────────────────────────────────────────────────
@@ -254,11 +257,14 @@ def test_is_engaged_fails_safe_on_stat_error(hermes_home, monkeypatch):
     """A stat failure must report ENGAGED (fail safe) — the pause has to
     hold even when HERMES_HOME is misbehaving, matching the module's
     corrupt-sentinel doctrine."""
-    class _BoomPath:
-        def exists(self):
-            raise OSError("permission denied")
+    original = Path.lstat
 
-    monkeypatch.setattr(estop, "sentinel_path", lambda: _BoomPath())
+    def denied(path, *args, **kwargs):
+        if path == hermes_home / "ESTOP":
+            raise PermissionError("fixture permission denied")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", denied)
     assert estop.is_engaged() is True
 
 
@@ -345,7 +351,10 @@ def test_profile_gateway_honors_canonical_root_estop(tmp_path, monkeypatch):
     still treat ~/.hermes/ESTOP as engaged. Otherwise `hermes pause` is not
     a global emergency stop (t_7b65ff88).
     """
-    root = tmp_path / "hermes-root"
+    home = tmp_path / "user-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    root = tmp_path / "hermes-state"
     profile = root / "profiles" / "fleet-analyst"
     profile.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(profile))

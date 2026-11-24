@@ -1,4 +1,6 @@
 import { useStore } from '@nanostores/react'
+import { wakeTrace } from '@/lib/wake-trace'
+import { onWakeTraceEnd, wakeTraceBlocked } from '@/lib/wake-trace-run'
 import { computed } from 'nanostores'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
@@ -338,8 +340,10 @@ export function useComposerVoice({
   )
 
   useEffect(() => {
-    if (target === 'main' && !disabled && takeVoiceConversationStart(voiceStartRequest) && !voiceConversationActive) {
-      activateConversation()
+    if (target === 'main' && !disabled && takeVoiceConversationStart(voiceStartRequest)) {
+      wakeTrace.bump('handoff_consumed')
+      if (wakeTraceBlocked()) wakeTrace.bump('late_handoffs_dropped')
+      else if (!voiceConversationActive) activateConversation()
     }
   }, [activateConversation, disabled, target, voiceConversationActive, voiceStartRequest])
 
@@ -353,7 +357,7 @@ export function useComposerVoice({
     // Reconcile, don't just resume: the wake word is a persistent setting, so
     // ending a voice chat must re-arm the listener whenever config says
     // enabled — including when the raw resume loses the mic-release race.
-    void resumeWakeAfterVoice()
+    if (!wakeTraceBlocked()) void resumeWakeAfterVoice()
   }, [])
 
   // The ref is a request token (did WE issue wake.pause?), not an atom mirror —
@@ -432,6 +436,8 @@ export function useComposerVoice({
     setVoiceConversationActive(false)
     void conversation.end()
   }, [conversation])
+
+  useEffect(() => target === 'main' ? onWakeTraceEnd(endConversation) : undefined, [endConversation, target])
 
   const handleToggleAutoSpeak = useCallback(() => {
     void setAutoSpeakReplies(!$autoSpeakReplies.get()).catch(error =>

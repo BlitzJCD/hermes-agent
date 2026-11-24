@@ -41,10 +41,19 @@ _TRUTHY_STRINGS = frozenset({"on", "true", "yes", "1", "approve", "enabled"})
 
 # --- Config resolution ---
 
+def memory_owner_approval_required() -> bool:
+    """Whether this profile stages all native memory writes for local review."""
+    from hermes_cli.config import cfg_get, load_config
+
+    return _normalize_enabled(cfg_get(load_config(), MEMORY, "owner_approval_only", default=False))
+
+
 def write_approval_enabled(subsystem: str) -> bool:
     """Read ``<subsystem>.write_approval``; any unset/invalid value means gate off."""
     if subsystem not in _SUBSYSTEMS:
         return False
+    if subsystem == MEMORY and memory_owner_approval_required():
+        return True
     try:
         from hermes_cli.config import load_config, cfg_get
         return _normalize_enabled(cfg_get(load_config(), subsystem, CONFIG_KEY, default=False))
@@ -63,7 +72,12 @@ def _normalize_enabled(value: Any) -> bool:
 # --- Pending store (file-backed) ---
 
 def _pending_path(subsystem: str, pending_id: str) -> Path:
-    return get_hermes_home() / "pending" / subsystem / f"{pending_id}.json"
+    home = get_hermes_home()
+    path = home / "pending" / subsystem / f"{pending_id}.json"
+    if subsystem == MEMORY and memory_owner_approval_required():
+        if path.resolve() != home.resolve() / "pending" / subsystem / f"{pending_id}.json":
+            raise ValueError("Pending memory path escapes its profile.")
+    return path
 
 
 def _pending_files(subsystem: str) -> list:
@@ -94,6 +108,7 @@ def list_pending(subsystem: str) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for p in _pending_files(subsystem):
         try:
+            p = _pending_path(subsystem, p.stem)
             record = json.loads(p.read_text(encoding="utf-8-sig"))
             if not isinstance(record, dict):
                 raise ValueError(f"expected a JSON object, got {type(record).__name__}")
@@ -106,10 +121,10 @@ def list_pending(subsystem: str) -> list[dict[str, Any]]:
 
 def get_pending(subsystem: str, pending_id: str) -> Optional[dict[str, Any]]:
     """Return a single pending record by id, or None."""
-    path = _pending_path(subsystem, pending_id)
-    if not path.exists():
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", pending_id):
         return None
     try:
+        path = _pending_path(subsystem, pending_id)
         data = json.loads(path.read_text(encoding="utf-8-sig"))
         return data if isinstance(data, dict) else None
     except Exception:
@@ -118,6 +133,8 @@ def get_pending(subsystem: str, pending_id: str) -> Optional[dict[str, Any]]:
 
 def discard_pending(subsystem: str, pending_id: str) -> bool:
     """Delete a pending record. Returns True if it existed."""
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", pending_id):
+        return False
     try:
         path = _pending_path(subsystem, pending_id)
         if path.exists():
@@ -203,6 +220,8 @@ def evaluate_gate(subsystem: str, *, inline_summary: str = "", inline_detail: st
     background → stage; gate on + memory + foreground → inline prompt when an interactive channel
     exists, else stage. The gate only ever delays a write, never silently refuses it; ``blocked``
     is produced only when the user actively denies the inline prompt."""
+    if subsystem == MEMORY and memory_owner_approval_required():
+        return GateDecision(stage=True, message="Staged for review in the profile's local Hermes CLI.")
     if not write_approval_enabled(subsystem):
         return GateDecision(allow=True)
     # Skills are too big to review inline; a background write runs in a daemon thread with no user.

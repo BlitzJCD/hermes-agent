@@ -695,6 +695,10 @@ class TestJWTTokens:
     """JWT tokens start with eyJ (base64 for '{') and have dot-separated parts."""
 
 
+    def test_single_part_base64_json_not_redacted(self):
+        payload = "eyJzdGF0dXMiOiJvayIsImFydGlmYWN0Ijoic3ludGhldGljIn0="
+        assert redact_sensitive_text(payload) == payload
+
     def test_2part_jwt(self):
         text = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0"
         result = redact_sensitive_text(text)

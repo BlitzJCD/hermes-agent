@@ -82,7 +82,7 @@ id within a ledger, so ids stay stable across many search/extract rounds.
 | Render the Sources block | `sources.py render [--style markdown\|plain\|footnotes\|bibtex\|evidence] [--only 1,3]` |
 | Render only what a draft cites | `sources.py render --cited-in draft.md` |
 | Rewrite a draft's Sources block in place | `sources.py render --replace-in draft.md` |
-| Check a draft's citations | `sources.py verify draft.md [--strict] [--min-coverage 0.6] [--evidence]` |
+| Check a draft's citations | `sources.py verify draft.md [--strict] [--min-coverage 0.6] [--evidence] [--quotes]` |
 
 ## Procedure
 
@@ -120,6 +120,22 @@ PDF/LaTeX, a Sources slide in decks, per-page source lists in wiki output).
 ⑤ **Verify before delivering** — `sources.py verify <draft>` exits non-zero on
 unknown ids, on a Sources block that disagrees with the ledger, or (with
 `--min-coverage`) on prose that is too thinly cited. Fix and re-run.
+
+For an offline review of a draft's exact quotations, use
+`sources.py --ledger <task-ledger> verify draft.md --quotes`. Put each direct
+quotation in its own Markdown blockquote and attach its source IDs at the end
+of that block.
+
+```markdown
+> The fixture contains 42 records.[1]
+```
+
+Attach the full quoted wording to the cited entry using `quote --from` with
+the saved source text. The check requires a matching ledger quote for every
+blockquote and fails if the draft has none. It uses the same whitespace, case
+and inline Markdown normalization as `quote`. Use `--evidence` alongside it to
+also require evidence for sources cited outside quotations. Paraphrases and
+claim entailment still require review.
 
 ⑥ **Chat answers** follow the same steps with the draft in your reply: register
 sources, cite inline, end with the rendered `Sources:` list. For a short answer

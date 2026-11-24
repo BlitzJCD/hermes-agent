@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { wakeTrace } from '@/lib/wake-trace'
 
 import { type ResolvedOwner, resolveOwnerNow } from '@/hermes'
 import { useI18n } from '@/i18n'
@@ -406,6 +407,7 @@ export function useVoiceConversation({
         return
       }
 
+      wakeTrace.bump('voice_capture_started')
       setStatus('listening')
       // Same warm-up as push-to-talk dictation: a cold local model loads while
       // the user speaks instead of inside the transcription timeout (#105955).
@@ -426,6 +428,7 @@ export function useVoiceConversation({
         return
       }
 
+      wakeTrace.bump('voice_start_errors')
       notifyError(error, voiceCopy.couldNotStartSession)
       pendingStartRef.current = false
       setStatus('idle')

@@ -83,11 +83,9 @@ def _pin_matched_entries(store: MemoryStore, payload: dict[str, Any]) -> Optiona
 
 def _gate_or_stage(store: MemoryStore, summary: str, detail: str, payload: dict[str, Any]) -> Optional[str]:
     """JSON tool-result string when the write must NOT proceed (blocked or staged
-    for approval), None to proceed. Fails open if the gate module can't load."""
-    try:
-        from tools import write_approval as wa
-    except Exception:
-        return None
+    for approval), None to proceed."""
+    from tools import write_approval as wa
+
     decision = wa.evaluate_gate(wa.MEMORY, inline_summary=summary, inline_detail=detail)
     if decision.allow:
         return None
@@ -227,6 +225,8 @@ def memory_tool(action: str | None = None, target: str = "memory", content: str 
     aliases ``content``."""
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
+    if not store.matches_active_profile():
+        return tool_error("Memory store belongs to another profile.", success=False)
     token = FAILURE_CLASS.set("other")
     try:
         outcome, result = _memory_tool(action, target, content, old_text, new_text, operations, store)
@@ -235,6 +235,12 @@ def memory_tool(action: str | None = None, target: str = "memory", content: str 
         FAILURE_CLASS.reset(token)
     from hermes_cli.observability.shared_metrics_loop import record_builtin_memory_call
     record_builtin_memory_call(action, operations, outcome=outcome, failure_class=failure_class)
+    from tools.write_approval import memory_owner_approval_required
+
+    if memory_owner_approval_required():
+        from agent.redact import redact_sensitive_text
+
+        result = redact_sensitive_text(result, force=True, redact_url_credentials=True)
     return result
 
 
@@ -355,6 +361,8 @@ def apply_memory_pending(payload: dict[str, Any], store: MemoryStore) -> dict[st
     replace/remove applies to exactly its pinned ``matched_entry`` or is refused; a record
     staged before pinning has no verifiable target, so it is refused rather than replayed by
     old_text (which could hit a newer entry the approver never saw)."""
+    if not store.matches_active_profile():
+        return {"success": False, "error": "Memory store belongs to another profile."}
     action, target = payload.get("action"), payload.get("target")
     target_error = _memory_target_error(store, target, payload.get("operations"))
     if target_error is not None:

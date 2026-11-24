@@ -190,25 +190,29 @@ async def _fetch_with_rescue(provider, fetch_urls: list[str], format: Optional[s
     return results, False
 
 
-async def _final_url_refusal(fetched: dict) -> Optional[dict]:
+async def _final_url_refusal(fetched: dict, requested: set[str]) -> Optional[dict]:
     """Refusal entry when a page's reported (post-redirect) URL fails the website policy or SSRF gate,
     in the shape Firecrawl's own redirect re-check returns; None when it passes. A policy check that
     raises refuses (fail closed): the requested URL passed, but nothing vouches for this one."""
     from tools.url_safety import async_is_safe_url
     from tools.website_policy import check_website_access
-    final_url, title = fetched["url"], fetched.get("title", "")
-    refusal = {"url": final_url, "title": title, "content": "", "raw_content": ""}
+    final_url = fetched["url"]
+    metadata = fetched.get("metadata")
+    source = (metadata.get("sourceURL") or metadata.get("source_url")) if isinstance(metadata, dict) else None
+    requested_url = source if isinstance(source, str) and source in requested else ""
+    refusal = {"url": requested_url,
+               "title": "", "content": "", "raw_content": ""}
     try:
         blocked = check_website_access(final_url)
-    except Exception as exc:
-        logger.warning("Website policy check failed for redirect target %s", final_url, exc_info=True)
-        return {**refusal, "error": f"Website policy check failed for redirect target: {exc}"}
+    except Exception:
+        logger.warning("Website policy check failed for an extraction redirect target")
+        return {**refusal, "error": "Website policy check failed for redirect target"}
     if blocked:
         logger.info("Blocked redirected web_extract for %s by rule %s", blocked["host"], blocked["rule"])
         policy = {k: blocked[k] for k in ("host", "rule", "source")}
         return {**refusal, "error": blocked["message"], "blocked_by_policy": policy}
     if not await async_is_safe_url(final_url):
-        logger.info("Blocked redirected web_extract for unsafe final URL: %s", final_url)
+        logger.info("Blocked redirected web_extract for an unsafe final URL")
         return {**refusal, "error": "Blocked: URL targets a private or internal network address"}
     return None
 
@@ -221,8 +225,8 @@ async def _gate_final_urls(results: list[dict], requested: set[str]) -> list[dic
     gated = []
     for fetched in results:
         url = fetched.get("url")
-        if url and url not in requested and not fetched.get("error"):
-            fetched = await _final_url_refusal(fetched) or fetched
+        if isinstance(url, str) and url and url not in requested:
+            fetched = await _final_url_refusal(fetched, requested) or fetched
         gated.append(fetched)
     return gated
 
@@ -276,29 +280,35 @@ async def _extract_safe_urls(provider, safe_urls: list[str], format: Optional[st
 
     The disk cache (tools/web_result_cache.py) sits AFTER the secret-URL gate, SSRF gate, and provider
     resolution, and is gated per-URL on the website policy — a hit skips only the vendor call, never a
-    control; policy-blocked URLs are cache misses, judged on both the requested and the cached final URL. Keys include provider and format, so switching either
-    within the TTL never serves the other's content."""
+    control. Requests blocked by policy are refused before dispatch. Cache hits also check the
+    final URL, and keys include both provider and format."""
     from tools.web_result_cache import extract_cache_get
     from tools.website_policy import check_website_access as _check_site
-    cached_results, fetch_urls, fetch_positions = {}, [], []
+    resolved, fetch_urls, fetch_positions = {}, [], []
     for position, url in enumerate(safe_urls):
         try:
             _policy_block = _check_site(url)
         except Exception:
-            _policy_block = None
-        hit = extract_cache_get(url, format=format, provider=provider.name) if _policy_block is None else None
+            resolved[position] = _result_entry(url, "Website policy check failed for requested URL")
+            continue
+        if _policy_block is not None:
+            refused = _result_entry(url, _policy_block["message"])
+            refused["blocked_by_policy"] = {k: _policy_block[k] for k in ("host", "rule", "source")}
+            resolved[position] = refused
+            continue
+        hit = extract_cache_get(url, format=format, provider=provider.name)
         if hit is not None and not await _cached_final_url_allowed(hit, url):
             hit = None  # a miss: the live fetch re-checks the redirect and refuses with blocked_by_policy
         if hit is not None:
-            cached_results[position] = hit
+            resolved[position] = hit
         else:
             fetch_urls.append(url)
             fetch_positions.append(position)
 
     if not fetch_urls:
-        return [cached_results[i] for i in range(len(safe_urls))]
+        return [resolved[i] for i in range(len(safe_urls))]
     logger.info("Web extract via %s: %d URL(s)", provider.name, len(fetch_urls))
     results = await _dispatch_extract(provider, fetch_urls, format)
-    if not cached_results:
+    if not resolved:
         return results
-    return _merge_in_order(len(safe_urls), cached_results, fetch_positions, fetch_urls, results)
+    return _merge_in_order(len(safe_urls), resolved, fetch_positions, fetch_urls, results)

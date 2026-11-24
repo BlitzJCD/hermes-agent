@@ -217,8 +217,11 @@ def _yuanbao_notice(home: Path, *, process_env: bool = False) -> str:
 def _auth_store(home: Path) -> dict:
     """*home*'s ``auth.json``; ``{}`` when missing, unreadable or invalid (no login we can see)."""
     import json
+    path = home / "auth.json"
     try:
-        store = json.loads((home / "auth.json").read_text(encoding="utf-8-sig"))
+        if not path.exists():
+            return {}
+        store = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return {}
     return store if isinstance(store, dict) else {}

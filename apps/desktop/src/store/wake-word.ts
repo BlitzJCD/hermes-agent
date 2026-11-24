@@ -1,4 +1,6 @@
 import { atom } from 'nanostores'
+import { wakeTrace } from '@/lib/wake-trace'
+import { allowWakeTraceActivation, wakeTraceBlocked } from '@/lib/wake-trace-run'
 
 import { type ClientWakeCaptureHandle, startClientWakeCapture } from '@/lib/wake-client-capture'
 import { $gateway } from '@/store/gateway'
@@ -36,15 +38,24 @@ export const $wakeWord = atom<WakeWordState>(INITIAL_WAKE_WORD_STATE)
 
 /** Active client mic stream for remote wake (capture: client). */
 let clientCapture: ClientWakeCaptureHandle | null = null
+let captureEpoch = {}
+
+/** Current or last stopped fixed-schema counters; no microphone access is initiated. */
+export function readClientWakeDiagnostics(): Record<string, number | string> {
+  clientCapture?.diagnostics?.()
+  return wakeTrace.snapshot()
+}
 
 /** Stop client-side PCM capture (also called on wake.detected before voice). */
 export function stopClientCapture(): void {
+  captureEpoch = {}
   clientCapture?.stop()
   clientCapture = null
 }
 
 async function maybeStartClientCapture(result: WakeStartResponse | null | undefined): Promise<void> {
   stopClientCapture()
+  const epoch = captureEpoch
 
   if (!result?.started) {
     return
@@ -57,7 +68,7 @@ async function maybeStartClientCapture(result: WakeStartResponse | null | undefi
   }
 
   try {
-    clientCapture = await startClientWakeCapture({
+    const opened = await startClientWakeCapture({
       frameLength: result.frame_length,
       request: gatewayRequester,
       // The continuous PCM chain can die after arming (dead track, stalled
@@ -65,6 +76,7 @@ async function maybeStartClientCapture(result: WakeStartResponse | null | undefi
       // that can never fire is worse than an honest off state, so mirror the
       // start-failure path: drop the capture, show the reason, release the lease.
       onError: error => {
+        if (captureEpoch !== epoch) return
         stopClientCapture()
         const failed = $wakeWord.get()
         $wakeWord.set({
@@ -78,7 +90,10 @@ async function maybeStartClientCapture(result: WakeStartResponse | null | undefi
         void gatewayRequester('wake.stop', {}).catch(() => undefined)
       }
     })
+    if (captureEpoch !== epoch) opened.stop()
+    else clientCapture = opened
   } catch (error) {
+    if (captureEpoch !== epoch) return
     const current = $wakeWord.get()
     $wakeWord.set({
       ...current,
@@ -97,6 +112,7 @@ async function maybeStartClientCapture(result: WakeStartResponse | null | undefi
 }
 
 export interface WakeStatusResponse {
+  diagnostics?: Record<string, unknown> | null
   /** Armed but the selected backend input delivers only silence. */
   audio_silent?: boolean
   available?: boolean
@@ -211,6 +227,7 @@ export function applyWakeStatus(status: WakeStatusResponse | null | undefined): 
 /** Sync the atom from a `wake.start` response. A `{started:false, reason}`
  *  refusal keeps the toggle off and surfaces the reason as the tooltip. */
 export function applyWakeStartResult(result: WakeStartResponse | null | undefined): void {
+  if (wakeTraceBlocked()) { stopClientCapture(); return }
   const current = $wakeWord.get()
 
   if (result?.started) {
@@ -266,6 +283,7 @@ export function applyWakeStopResult(result: WakeStopResponse | null | undefined)
  * hidden default.
  */
 export async function armWakeWord(request: WakeRequester = gatewayRequester): Promise<void> {
+  if (wakeTraceBlocked()) return
   try {
     const status = await request<WakeStatusResponse>('wake.status', {
       client_capture: true,
@@ -274,6 +292,7 @@ export async function armWakeWord(request: WakeRequester = gatewayRequester): Pr
 
     applyWakeStatus(status)
 
+    if (wakeTraceBlocked()) return
     if (!status?.available || status.listening) {
       // Armed already (e.g. another surface/restart) — reattach feeder if client.
       if (status?.listening) {
@@ -322,6 +341,7 @@ export async function toggleWakeWord(request: WakeRequester = gatewayRequester):
     if (state.listening) {
       applyWakeStopResult(await request<WakeStopResponse>('wake.stop', { persist: true }))
     } else {
+      allowWakeTraceActivation()
       // persist: true — a deliberate click is consent, so the backend flips
       // wake_word.enabled in config.yaml (on/off) and the choice sticks for
       // future sessions. Auto-arm (armWakeWord) never passes it.
@@ -357,6 +377,7 @@ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
  * this is a passive path and must not flip config.
  */
 export async function resumeWakeAfterVoice(request: WakeRequester = gatewayRequester): Promise<void> {
+  if (wakeTraceBlocked()) return
   try {
     await request('wake.resume', {})
   } catch {
@@ -365,12 +386,14 @@ export async function resumeWakeAfterVoice(request: WakeRequester = gatewayReque
   }
 
   for (let attempt = 0; attempt < 3; attempt++) {
+    if (wakeTraceBlocked()) return
     try {
       const status = await request<WakeStatusResponse>('wake.status', {
         client_capture: true,
         surface: 'gui'
       })
 
+      if (wakeTraceBlocked()) return
       applyWakeStatus(status)
 
       // Config says off (or the feature can't run) — off is the correct rest

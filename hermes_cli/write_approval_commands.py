@@ -33,7 +33,8 @@ def _fmt_pending_list(subsystem: str) -> str:
 
 
 def handle_pending_subcommand(
-    subsystem: str, args: list[str], *, memory_store=None, set_mode_fn=None) -> Optional[str]:
+    subsystem: str, args: list[str], *, memory_store=None, set_mode_fn=None, local_owner: bool = False,
+) -> Optional[str]:
     """Dispatch a /memory or /skills write-approval subcommand.
 
     ``memory_store`` applies approved memory writes (CLI passes its live store; gateway a freshly
@@ -41,6 +42,13 @@ def handle_pending_subcommand(
     or None when the args are not a write-approval subcommand so the caller falls through to its
     other handling (e.g. /skills search).
     """
+    if subsystem == wa.MEMORY and wa.memory_owner_approval_required():
+        if not local_owner:
+            return "Review this profile's memory from an interactive local Hermes CLI."
+        if args and args[0].lower() in {"approval", "mode"}:
+            return "This profile requires local memory approval in its configuration."
+        if len(args) > 1 and args[0].lower() in {"approve", "apply"} and args[1].lower() == "all":
+            return "Approve each memory proposal by its exact ID."
     if not args:
         return f"{_fmt_state(subsystem)}\n\n" + _fmt_pending_list(subsystem)
     sub, rest = args[0].lower(), args[1:]

@@ -14,12 +14,15 @@ import time
 from pathlib import Path
 from typing import Callable, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 
 from hermes_cli.session_listing import subagent_listing_scope
 from hermes_cli.web_deps import late
+from hermes_cli.web_session_ownership import (
+    require_session_operator, scoped_session_reader, session_request_scope, use_session_reader,
+)
 from hermes_cli.web_server_gateway import _strip_session_list_rows
 from hermes_cli.web_server_sessions import _session_latest_descendant
 from hermes_cli.web_models import (
@@ -31,9 +34,9 @@ from hermes_state import is_malformed_db_error
 from hermes_state_errors import SessionActiveWriteGuardError, StateDbReplacedError, is_transient_sqlite_error
 from hermes_state_health import STORAGE_CORRUPT, note_storage_error, storage_state
 
-list_router = APIRouter()
-search_router = APIRouter()
-manage_router = APIRouter()
+list_router = APIRouter(dependencies=[Depends(session_request_scope)])
+search_router = APIRouter(dependencies=[Depends(session_request_scope)])
+manage_router = APIRouter(dependencies=[Depends(session_request_scope)])
 
 _cron_default_profile = late("_cron_default_profile", "hermes_cli.web_server_cron")
 _cron_profile_home = late("_cron_profile_home", "hermes_cli.web_server_cron")
@@ -463,7 +466,7 @@ async def search_sessions(
         return await asyncio.to_thread(_with_db, profile, _search, read_only=True)
 
 
-@manage_router.post("/api/sessions/bulk-delete")
+@manage_router.post("/api/sessions/bulk-delete", dependencies=[Depends(require_session_operator)])
 async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
     """Delete every session in ``body.ids`` in one transaction (POST: many
     clients refuse a DELETE body).
@@ -516,7 +519,7 @@ async def count_empty_sessions_endpoint(profile: Optional[str] = None):
     return {"count": count}
 
 
-@manage_router.delete("/api/sessions/empty")
+@manage_router.delete("/api/sessions/empty", dependencies=[Depends(require_session_operator)])
 async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
     """Delete every empty, ended, non-archived session in one transaction.
 
@@ -587,7 +590,7 @@ async def get_session_detail(session_id: str, profile: Optional[str] = None):
 async def get_session_mutation_snapshot(session_id: str, request: Request, profile: Optional[str] = None):
     from hermes_cli.web_server_sessions import _session_mutation_context
     authority, _actor = _session_mutation_context(request, profile)
-    if authority is None:  # standalone serve: the counters the offline receipt checks
+    if authority is None or scoped_session_reader() is not None:
         row = await asyncio.to_thread(_with_db, profile, lambda db: db.get_session(session_id), read_only=True)
     else:
         row = authority.db.get_session(session_id)
@@ -869,8 +872,9 @@ async def delete_session_endpoint(session_id: str, request: Request, profile: Op
         # The authority also answers ``not_found`` for an EXISTING cold row it cannot restore
         # (e.g. an API-server row without its binding); that row was not deleted, so only a
         # genuinely absent id is the idempotent success.
-        if exc.status_code == 404 and exc.detail == 'not_found' and await asyncio.to_thread(
-                _with_db, profile, lambda db: db.get_session(session_id) is None, read_only=True):
+        if (scoped_session_reader() is None and exc.status_code == 404 and exc.detail == 'not_found'
+                and await asyncio.to_thread(
+                _with_db, profile, lambda db: db.get_session(session_id) is None, read_only=True)):
             return {"ok": True, "already_absent": True}
         raise
     # The canonical delete retires rows only: scrub each deleted session's on-disk artifacts
@@ -894,7 +898,7 @@ def _owner_db_for(request: Request, profile: Optional[str]):
     return getattr(authority, "db", None)
 
 
-@manage_router.post("/api/sessions/owner-backfill")
+@manage_router.post("/api/sessions/owner-backfill", dependencies=[Depends(require_session_operator)])
 async def backfill_session_owner_profiles(body: SessionOwnerBackfill, request: Request):
     """Stamp legacy ``profile_name = NULL`` rows with the serving-profile identity.
 
@@ -958,8 +962,11 @@ async def export_session_endpoint(session_id: str, profile: Optional[str] = None
 
     sid, session = prepared
 
+    reader = scoped_session_reader()
+
     def _stream_export():
-        db = _open_session_db_for_profile(profile, read_only=True)
+        with use_session_reader(reader):
+            db = _open_session_db_for_profile(profile, read_only=True)
         try:
             yield _compact_json(session)[:-1] + ',"messages":['
             # Keyset pagination (id > last_seen): O(n) total over the
@@ -981,7 +988,7 @@ async def export_session_endpoint(session_id: str, profile: Optional[str] = None
     return StreamingResponse(_stream_export(), media_type="application/json")
 
 
-@manage_router.post("/api/sessions/prune")
+@manage_router.post("/api/sessions/prune", dependencies=[Depends(require_session_operator)])
 async def prune_sessions_endpoint(body: SessionPrune):
     """Delete ended sessions matching filters without blocking the event loop."""
     if body.dry_run:

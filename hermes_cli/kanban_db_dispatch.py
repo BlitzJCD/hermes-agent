@@ -1558,22 +1558,19 @@ def check_respawn_guard(
 ) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
-    Called per ready/review row before any claim attempt. Priority order:
-    ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
-    refused — no restart-safe scope — within the cooldown; never counted),
-    ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
-    checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
-    ``last_failure_error`` that would otherwise park the task forever — that
-    path never increments ``consecutive_failures``), ``"blocker_auth"``
-    (quota/auth pattern; the breaker still trips eventually), then for the
-    ready lane only ``"recent_success"`` (completed run within the window, unless
-    a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
-    handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
-    handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
-    passes own those.
+    Both lanes check durable admission, infrastructure and quota cooldowns,
+    and auth failures. Check quota cooldown before auth because the requeue
+    records a quota-flavored error without incrementing consecutive failures.
+    Recent success and active PRs also guard the ready lane. Those can be the
+    inputs to review, and a later handoff can authorize work on that same PR.
+    Reclaim passes handle stale claims.
     """
+    from hermes_cli.kanban_dispatch_admission import dispatch_block_reason
+
+    admission_block = dispatch_block_reason(conn, task_id, lane)
+    if admission_block and admission_block != "terminal_run":
+        return admission_block
+
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
         (task_id,),
@@ -1586,8 +1583,7 @@ def check_respawn_guard(
     # 1. Rate-limit cooldown — see docstring for why this precedes blocker_auth.
     #    LATEST run only: a newer crash/completion supersedes the rate-limit run.
     #    An infrastructure spawn refusal (#114720) shares the cooldown: the host
-    #    condition is not the card's, so it retries forever, spaced, and never
-    #    reaches the breaker.
+    #    condition is not the card's, so it retries within the dispatch ceiling, spaced apart.
     rl_cooldown = _kb._resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
         "SELECT outcome, ended_at, metadata FROM task_runs "
@@ -1604,14 +1600,14 @@ def check_respawn_guard(
         if rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, skipping blocker_auth so
             # the stamped rate-limit text doesn't re-trap the task.
-            return None
+            return admission_block
         ended_at = _kb._to_epoch(latest_run["ended_at"])
         if ended_at is not None and (now - ended_at) < rl_cooldown:
             return "rate_limit_cooldown"
         # Cooldown elapsed — return early so blocker_auth doesn't catch the
-        # stamped rate-limit text; this path intentionally retries forever
-        # (spaced by the cooldown) until quota returns or a real run supersedes it.
-        return None
+        # stamped rate-limit text; the dispatch ceiling
+        # still applies to quota retries.
+        return admission_block
 
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
     # crash is different: its persisted error includes the worker's last
@@ -1625,7 +1621,7 @@ def check_respawn_guard(
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
     # are the canonical *inputs* to a review handoff, not duplicate-work signals.
     if lane == "review":
-        return None
+        return admission_block
 
     # 3. Completed run within guard window. Exception: an explicit re-queue
     #    AFTER that success (done→ready drag, re-promotion, unblock, reclaim) is
@@ -1636,6 +1632,8 @@ def check_respawn_guard(
     if success is not None and not any(_rows_since(
             conn, "task_events", task_id, success, "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed')")):
         return "recent_success"
+    if admission_block:
+        return admission_block
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     #    Exception: a handoff AFTER the newest PR comment (operator reassign,
@@ -1789,18 +1787,15 @@ def dispatch_profile_allowlist_summary() -> str:
 
 
 def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
-    rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
-        (status,),
-    ).fetchall()
-    if not rows:
-        return False
+    from hermes_cli.kanban_dispatch_admission import dispatch_block_reason
+
     profile_exists = _profile_exists_fn()
-    if profile_exists is None:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
-    return any(profile_exists(row["assignee"]) for row in rows)
+    return any(
+        row["assignee"]
+        and (profile_exists is None or profile_exists(row["assignee"]))
+        and dispatch_block_reason(conn, row["id"], status) is None
+        for row in _lane_rows(conn, status)
+    )
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -2042,11 +2037,11 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
     import inspect
     try:
         sig = inspect.signature(spawn_fn)
-        if "board" in sig.parameters:
-            return spawn_fn(task, workspace, board=board)
-        return spawn_fn(task, workspace)
     except (TypeError, ValueError):
         return spawn_fn(task, workspace)
+    if "board" in sig.parameters:
+        return spawn_fn(task, workspace, board=board)
+    return spawn_fn(task, workspace)
 
 
 def _dispatch_lane_task(
@@ -2136,6 +2131,7 @@ def _dispatch_lane_task(
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            force_trip=isinstance(exc, (ValueError, PermissionError, FileNotFoundError)),
         ):
             result.auto_blocked.append(claimed.id)
         return False
@@ -2162,14 +2158,15 @@ def _dispatch_lane_task(
     except Exception as exc:
         from tools.process_registry import RestartSafeScopeUnavailable
 
-        # The host refused the spawn (no restart-safe scope): nothing about the
-        # card ran, so it must not spend the card's retry budget (#114720).
+        # A missing restart-safe scope bypasses the consecutive-failure
+        # breaker. The durable dispatch attempt still counts toward the ceiling.
         infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
         if infrastructure:
             _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
         if _record_task_failure(
             conn, claimed.id, str(exc),
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            force_trip=isinstance(exc, (ValueError, PermissionError, FileNotFoundError)),
             infrastructure=infrastructure,
         ):
             result.auto_blocked.append(claimed.id)

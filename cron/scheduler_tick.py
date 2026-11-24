@@ -87,6 +87,8 @@ def _pre_dispatch_housekeeping(_sched, headless: bool) -> None:
     except Exception as _legacy_exc:
         _sched.logger.warning("Legacy Bot Chat pending drain failed: %s", _legacy_exc, exc_info=True)
     _sched._maybe_reap_dead_owners()
+    from cron.scheduler_recovery import settle_terminal_fire_claims
+    settle_terminal_fire_claims()
 
 
 def _tick_admitted(

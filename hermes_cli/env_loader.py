@@ -408,6 +408,8 @@ def resolve_home_dotenv(home: Path) -> dict[str, str]:
     out: dict[str, str] = {}
     for path in layers:
         try:
+            if not path.exists():
+                continue
             assignments = _parse_dotenv_file(path)
         except OSError:
             continue
@@ -506,6 +508,8 @@ def _bootstrap_env(home: Path | None = None, project_env: Path | None = None) ->
         layers.append((managed_dir / ".env", True))
     for path, override in layers:
         try:
+            if not path.exists():
+                continue
             assignments = _dotenv_assignments(path)
         except OSError:
             continue

@@ -86,26 +86,22 @@ def _session_mutation_context(request, profile):
     """Use the same principal and profile boundary for prepare and apply."""
     from fastapi import HTTPException
     from gateway.session_contract import SessionActor
-    from hermes_cli.web_server import _has_valid_session_token
+    from gateway.owner_identity import host_owner_subject
     from hermes_cli.web_server_cron import _cron_profile_home
+    from hermes_cli.web_session_ownership import request_session_subject
     from hermes_state import _default_db_path
 
     native = getattr(request.state, 'native_http_principal', None)
-    session = getattr(request.state, 'session', None)
-    if native is not None:
-        subject = native['subject']
-    elif session is not None:
-        from gateway.owner_identity import principal_subject
-        subject = principal_subject({"user_id": session.user_id,
-            "provider": session.provider, "issuer": session.issuer})
-    elif not getattr(request.app.state, 'auth_required', False) and _has_valid_session_token(request):
-        from gateway.owner_identity import host_owner_subject
-        subject = host_owner_subject()
-    else:
+    subject = request_session_subject(request)
+    if not subject:
         raise HTTPException(status_code=401, detail='Unauthorized')
     authority = getattr(request.app.state, 'session_authority', None)
     home = Path(_cron_profile_home(profile)[1]) if profile else Path(_default_db_path()).parent
-    capabilities = frozenset({'session:read', 'session:control', 'session:create', 'session:operator'})
+    capabilities = frozenset({'session:read', 'session:control', 'session:create'})
+    if subject == host_owner_subject():
+        capabilities |= {'session:operator'}
+    if native is not None and home.resolve() != Path(native['profile_id']).resolve():
+        raise HTTPException(status_code=403, detail='profile_scope_mismatch')
     if authority is None:
         if getattr(request.app.state, 'gateway_runner', None) is not None:
             raise HTTPException(status_code=503, detail='session_authority_unavailable')
@@ -163,7 +159,7 @@ def _mutate_offline_store(profile, actor, params):
     def run():
         db = _open_session_db_for_profile(profile, read_only=False)
         try:
-            write_guard = None
+            write_guard = _offline_session_owner_guard(db, actor, params)
             if params['operation'] == 'import':
                 normalized, errors = db._validate_import_payload(params['payload']['sessions'])
                 if errors:
@@ -183,6 +179,31 @@ def _mutate_offline_store(profile, actor, params):
         finally:
             db.close()
     return _with_session_maintenance(profile, run)
+
+
+def _offline_session_owner_guard(db, actor, params):
+    """Authorize before reporting revisions, then recheck on the receipt's writer."""
+    from hermes_cli.web_session_ownership import owns_stored_session
+    from hermes_state_mutation_retirement import has_mutation_receipt
+    from hermes_state_runtime import RuntimeStoreError
+
+    if 'session:operator' in actor.capabilities or params['operation'] == 'import':
+        return None
+    sid = params['session_id']
+
+    def require_owned(conn):
+        if not owns_stored_session(conn, actor.subject, sid):
+            raise RuntimeStoreError('not_found')
+        if params['operation'] == 'delete':
+            from hermes_state_mutation_guards import delete_targets
+
+            if any(not owns_stored_session(conn, actor.subject, target) for target in delete_targets(conn, sid)):
+                raise RuntimeStoreError('permission_denied')
+
+    if not has_mutation_receipt(db, actor.subject, sid, params['request_id']):
+        with db._read_ctx() as conn:
+            require_owned(conn)
+    return require_owned
 
 
 async def _mutate_via_gateway_owner(profile, actor, params):
@@ -382,6 +403,8 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
             if conn is not None:
                 for statement in _session_db_read_probe_statements():
                     conn.execute(statement).fetchone()
+            from hermes_cli.web_session_ownership import bind_dashboard_reads
+            bind_dashboard_reads(db)
             return db
         except BaseException:
             db.close()
