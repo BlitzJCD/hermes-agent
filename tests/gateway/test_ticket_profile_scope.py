@@ -1,4 +1,5 @@
 """An issued interactive ticket keeps its profile scope across sibling selectors (#106742 W1)."""
+import gateway.run  # noqa: F401
 import json
 from pathlib import Path
 
